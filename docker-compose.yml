@@ -1,0 +1,177 @@
+version: "3.8"
+
+services:
+  # --- Nginx 反向代理 ---
+  nginx:
+    image: nginx:alpine
+    container_name: eva-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - eva-net
+    restart: unless-stopped
+
+  # --- Next.js 前端 ---
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: eva-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://backend:8000
+    depends_on:
+      - backend
+    networks:
+      - eva-net
+    restart: unless-stopped
+
+  # --- FastAPI 后端 ---
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: eva-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_USER=eva
+      - DB_PASSWORD=eva_secret
+      - DB_NAME=eva
+      - REDIS_URL=redis://redis:6379/0
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - JWT_SECRET=${JWT_SECRET:-eva-prod-secret}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - CORS_ORIGINS=["http://localhost:3000","http://localhost"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - eva-net
+    restart: unless-stopped
+
+  # --- MCP 服务 ---
+  mcp-server:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.mcp
+    container_name: eva-mcp
+    ports:
+      - "8001:8001"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - REDIS_URL=redis://redis:6379/0
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+    depends_on:
+      - backend
+    networks:
+      - eva-net
+    restart: unless-stopped
+
+  # --- MySQL 8.4 ---
+  mysql:
+    image: mysql:8.4
+    container_name: eva-mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root_secret
+      MYSQL_DATABASE: eva
+      MYSQL_USER: eva
+      MYSQL_PASSWORD: eva_secret
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - eva-net
+    restart: unless-stopped
+
+  # --- Redis 7 ---
+  redis:
+    image: redis:7-alpine
+    container_name: eva-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - eva-net
+    restart: unless-stopped
+
+  # --- Milvus 向量数据库 ---
+  milvus:
+    image: milvusdb/milvus:v2.4.17
+    container_name: eva-milvus
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      - milvus-data:/var/lib/milvus
+    depends_on:
+      - etcd
+      - minio
+    networks:
+      - eva-net
+    restart: unless-stopped
+
+  # --- etcd (Milvus 元数据) ---
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: eva-etcd
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379
+    ports:
+      - "2379:2379"
+    networks:
+      - eva-net
+    restart: unless-stopped
+
+  # --- MinIO (Milvus 对象存储) ---
+  minio:
+    image: minio/minio:latest
+    container_name: eva-minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: minio server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - eva-net
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+  redis-data:
+  milvus-data:
+  minio-data:
+
+networks:
+  eva-net:
+    driver: bridge
