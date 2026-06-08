@@ -82,7 +82,14 @@
       "Bash(python *)",
       "Bash(awk '{print $2,$5}')",
       "Bash(cd /d D:\\\\11_Agent\\\\EVA\\\\frontend)",
-      "Bash(npx tsc *)"
+      "Bash(npx tsc *)",
+      "Bash(cat .gitmodules)",
+      "Bash(ls -la frontend/.git)",
+      "Bash(git log *)",
+      "Bash(git rm *)",
+      "Bash(rm -rf frontend/.git)",
+      "Bash(git reset *)",
+      "Bash(git add *)"
     ]
   }
 }

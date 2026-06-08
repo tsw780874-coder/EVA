@@ -1,0 +1,36 @@
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: #F9F9FB;
+  color: #111111;
+  font-family: var(--font-sans, Arial, Helvetica, sans-serif);
+  font-size: 15px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* 全局增强：让标签类文字更可读 */
+label, .label-text {
+  color: #555;
+  font-weight: 600;
+}
+
+/* 灰色文字增强对比度 */
+.text-gray-300 { color: #888 !important; }
+.text-gray-400 { color: #666 !important; }
+.text-gray-500 { color: #444 !important; }
+
+/* 小字增强 */
+.text-\[9px\] { font-size: 10px !important; }
+.text-\[10px\] { font-size: 11px !important; }
+
+/* 共享衬线字体 */
+.font-serif { font-family: 'Times New Roman', serif; }
+
+/* 链接和按钮更明显的 hover */
+a:hover, button:hover { transition: all 0.2s ease; }
