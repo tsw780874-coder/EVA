@@ -89,7 +89,13 @@
       "Bash(git rm *)",
       "Bash(rm -rf frontend/.git)",
       "Bash(git reset *)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(gh auth *)",
+      "Bash(git remote *)",
+      "Bash(git config *)",
+      "Bash(git *)"
     ]
   }
 }
