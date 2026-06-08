@@ -52,12 +52,6 @@ docker-compose up -d
 - 健康检查：http://localhost:8000/health
 - MCP Server：http://localhost:8001/mcp
 
-### 默认账户
-
-| 角色 | 邮箱 | 密码 |
-|------|------|------|
-| 管理员 | admin@eva.com | admin123 |
-| 普通用户 | user@eva.com | user123 |
 
 ### 3. 本地开发
 
