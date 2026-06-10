@@ -117,6 +117,7 @@ async def stream_chat(
 
     async def event_stream():
         full_reply = ""
+        perf_timing: dict = {}
         try:
             async for chunk in run_agent_stream(body.content, chat_history, current_user.id):
                 # Extract final_report for persistence
@@ -130,6 +131,15 @@ async def stream_chat(
                             full_reply = text
                     except Exception:
                         pass
+                # Capture perf timing
+                if "perf" in chunk:
+                    try:
+                        prefix = "data: "
+                        data_str = chunk[len(prefix):] if chunk.startswith(prefix) else chunk
+                        data = json.loads(data_str)
+                        perf_timing = data.get("timing", {})
+                    except Exception:
+                        pass
                 yield chunk
 
             # Background persistence — don't block stream close
@@ -139,10 +149,17 @@ async def stream_chat(
 
             asyncio.create_task(_persist_results(
                 db, session_id, current_user.id, body.content,
-                reply_content, duration_ms, now,
+                reply_content, duration_ms, now, perf_timing,
             ))
 
-            append_log("SUCCESS", f"Agent 完成，耗时 {duration_ms:.0f}ms")
+            # Structured perf log
+            if perf_timing:
+                timing_parts = " | ".join(
+                    f"{k}: {v}" for k, v in perf_timing.items()
+                )
+                append_log("SUCCESS", f"Agent 完成，耗时 {duration_ms:.0f}ms [{timing_parts}]")
+            else:
+                append_log("SUCCESS", f"Agent 完成，耗时 {duration_ms:.0f}ms")
         except Exception as e:
             append_log("ERROR", f"Agent 异常: {str(e)[:100]}")
 
@@ -165,6 +182,7 @@ async def _persist_results(
     reply_content: str,
     duration_ms: float,
     now: datetime,
+    perf_timing: dict | None = None,
 ) -> None:
     """Persist chat message, report, and agent run in parallel."""
     try:
@@ -200,7 +218,7 @@ async def _persist_results(
                         status="success",
                         duration_ms=int(duration_ms),
                         input_data={"query": query},
-                        output_data={"report": reply_content[:500]},
+                        output_data={"report": reply_content[:500], "perf": perf_timing or {}},
                         created_at=now,
                     )
                 ),

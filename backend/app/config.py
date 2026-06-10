@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     debug: bool = True
 
     # Database
-    use_sqlite: bool = True
+    use_sqlite: bool = False
     db_host: str = "localhost"
     db_port: int = 3306
     db_user: str = "eva"

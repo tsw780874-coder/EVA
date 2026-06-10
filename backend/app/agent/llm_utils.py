@@ -1,27 +1,45 @@
-"""LLM call utility — race-based with streaming callback.
+"""LLM call utility — race-based with streaming callback + model routing.
 
-Single-purpose module.  No token queues, no graph coupling.
-Callers pass an optional async callback for streaming tokens.
+v4 optimizations:
+- Dynamic provider routing via model_router (simple→Groq, complex→DeepSeek)
+- Redis cache layer with in-memory fallback
+- Token estimation for prompt size monitoring
+- Streaming callback unchanged (progressive token delivery)
 """
 
 import asyncio
 import hashlib
 import time
-from typing import Callable, Awaitable
+from typing import Callable, Awaitable, Sequence
+
 from app.core.llm import get_llm_client, get_model_name, track_token_usage, track_model_latency
 from app.api.v1.admin import append_log
 
-FALLBACK_ORDER = ["groq", "glm_flash", "ernie35", "deepseek", "openai", "glm47_flash", "ernie_speed"]
+# Default fallback when no router is used
+DEFAULT_PROVIDERS = ["groq", "glm_flash", "ernie35", "deepseek"]
 MAX_ATTEMPTS = 4
-_LLM_CALL_TIMEOUT = 2.5  # per-provider timeout — Groq LPU responds in < 500ms
+_LLM_CALL_TIMEOUT = 2.5  # per-provider timeout
 
-# Response cache: key → (expiry_ts, content, provider)
+# ── In-memory fallback cache (always available) ──
 _cache: dict[str, tuple[float, str, str]] = {}
 _CACHE_TTL = 300
 
 
 def _cache_key(system_prompt: str, user_message: str) -> str:
     return hashlib.sha256(f"{system_prompt}|||{user_message}".encode()).hexdigest()
+
+
+# ── Token estimation (fast, no API call) ──
+def estimate_tokens(text: str) -> int:
+    """Rough token count: ~4 chars per token for Chinese, ~3 for English."""
+    chinese = sum(1 for c in text if '一' <= c <= '鿿')
+    other = len(text) - chinese
+    return int(chinese * 0.6 + other * 0.25)
+
+
+def estimate_messages_tokens(messages: list[dict]) -> int:
+    """Estimate total tokens for a list of messages."""
+    return sum(estimate_tokens(m.get("content", "")) for m in messages) + len(messages) * 4
 
 
 async def llm_call(
@@ -35,28 +53,62 @@ async def llm_call(
     response_format: dict | None = None,
     stream_callback: Callable[[str], Awaitable[None]] | None = None,
     bypass_cache: bool = False,
-) -> tuple[str, str]:
+    providers: Sequence[str] | None = None,
+    per_provider_timeout: float | None = None,
+) -> tuple[str, str, float]:
     """Race multiple providers, return first successful response.
 
-    When stream_callback is provided, it's called for each token chunk
-    as it arrives — the caller gets progressive output before this
-    function returns.
+    When stream_callback is provided, tokens are delivered progressively
+    via the callback BEFORE this function returns.
+
+    Args:
+        providers: Ordered list of provider keys to try. Defaults to DEFAULT_PROVIDERS.
+        per_provider_timeout: Timeout per provider in seconds. Defaults to _LLM_CALL_TIMEOUT.
+
+    Returns:
+        (content, provider_name, elapsed_ms)
     """
     ck = _cache_key(system_prompt, user_message)
 
+    # ── 1. Redis cache check (with in-memory fallback) ──
+    if not bypass_cache:
+        try:
+            from app.cache.redis_cache import get_cache
+            cache_layer = await get_cache()
+            if (cached := await cache_layer.get(f"eva:llm:{ck}")):
+                provider = cached.get("p", "cache")
+                content = cached.get("c", "")
+                append_log("INFO", f"{node_name} 命中Redis缓存 (provider={provider})")
+                if stream_callback:
+                    await stream_callback(content)
+                return content, provider, 0.0
+        except Exception:
+            pass
+
+    # ── 2. In-memory cache check ──
     if not bypass_cache and ck in _cache:
         expiry, content, provider = _cache[ck]
         if time.time() < expiry:
-            append_log("INFO", f"{node_name} 命中缓存 (provider={provider})")
+            append_log("INFO", f"{node_name} 命中内存缓存 (provider={provider})")
             if stream_callback:
                 await stream_callback(content)
-            return content, provider
+            return content, provider, 0.0
         del _cache[ck]
 
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message},
     ]
+
+    # Token estimate for logging
+    est_tokens = estimate_messages_tokens(messages)
+
+    # ── 3. Determine providers ──
+    provider_list = list(providers or DEFAULT_PROVIDERS)
+    if not provider_list:
+        provider_list = list(DEFAULT_PROVIDERS)
+    provider_list = provider_list[:MAX_ATTEMPTS]
+    timeout = per_provider_timeout or _LLM_CALL_TIMEOUT
 
     async def _try_provider(provider: str) -> tuple[str, str] | None:
         try:
@@ -81,7 +133,7 @@ async def llm_call(
             if use_stream:
                 resp = await asyncio.wait_for(
                     client.chat.completions.create(**kwargs),
-                    timeout=_LLM_CALL_TIMEOUT,
+                    timeout=timeout,
                 )
                 chunks: list[str] = []
                 async for chunk in resp:
@@ -93,22 +145,41 @@ async def llm_call(
             else:
                 resp = await asyncio.wait_for(
                     client.chat.completions.create(**kwargs),
-                    timeout=_LLM_CALL_TIMEOUT,
+                    timeout=timeout,
                 )
                 content = resp.choices[0].message.content or ""
                 if resp.usage:
                     track_token_usage(user_id, provider, resp.usage.total_tokens)
+                    actual_tokens = resp.usage.total_tokens
+                    append_log(
+                        "DEBUG",
+                        f"{node_name} tokens: est={est_tokens} actual={actual_tokens} provider={provider}",
+                    )
 
             elapsed_ms = (time.perf_counter() - t0) * 1000
             track_model_latency(provider, elapsed_ms)
 
+            # ── Store in both caches ──
             _cache[ck] = (time.time() + _CACHE_TTL, content, provider)
+            try:
+                from app.cache.redis_cache import get_cache
+                cache_layer = await get_cache()
+                await cache_layer.set(
+                    f"eva:llm:{ck}",
+                    {"c": content, "p": provider, "t": elapsed_ms},
+                    ttl=_CACHE_TTL,
+                )
+            except Exception:
+                pass
+
             return content, provider
         except (asyncio.TimeoutError, Exception):
             return None
 
-    providers = FALLBACK_ORDER[:MAX_ATTEMPTS]
-    tasks = [asyncio.create_task(_try_provider(p)) for p in providers]
+    t_total = time.perf_counter()
+
+    # ── 4. Race providers ──
+    tasks = [asyncio.create_task(_try_provider(p)) for p in provider_list]
 
     try:
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -117,21 +188,33 @@ async def llm_call(
             if result is not None:
                 for pt in pending:
                     pt.cancel()
-                return result
+                content, provider = result
+                elapsed_ms = (time.perf_counter() - t_total) * 1000
+                append_log(
+                    "SUCCESS",
+                    f"{node_name} 完成 ({elapsed_ms:.0f}ms, est_tokens={est_tokens}) "
+                    f"provider={provider} route={'→'.join(provider_list[:3])}",
+                )
+                return content, provider, elapsed_ms
 
         # Second wave
         if pending:
-            done2, pending2 = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED, timeout=2.0)
+            done2, pending2 = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED, timeout=2.0,
+            )
             for t in done2:
                 result = t.result()
                 if result is not None:
                     for pt in pending2:
                         pt.cancel()
-                    return result
+                    content, provider = result
+                    elapsed_ms = (time.perf_counter() - t_total) * 1000
+                    return content, provider, elapsed_ms
     finally:
         for t in tasks:
             if not t.done():
                 t.cancel()
 
-    append_log("WARN", f"{node_name} 模型调用全部失败")
-    return "", ""
+    elapsed_ms = (time.perf_counter() - t_total) * 1000
+    append_log("WARN", f"{node_name} 模型调用全部失败 ({elapsed_ms:.0f}ms)")
+    return "", "", elapsed_ms

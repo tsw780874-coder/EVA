@@ -1,9 +1,10 @@
 """Product template database — instant responses for common queries.
 
-Maps keywords → realistic product data across multiple platforms.
-No LLM call needed — matching takes < 1 ms.
+⚠️ SIMULATED DATA ONLY — NOT REAL PRICES.
+These templates exist as a development fallback and for instant UX feedback.
+All data is explicitly marked with source="simulated" and confidence=0.0.
 
-For queries that don't match a template, the LLM pipeline serves as fallback.
+For production use, RAG search should be the primary data source.
 """
 
 import hashlib
@@ -84,6 +85,8 @@ def _make_products(keyword: str, base_name: str, prices: list[tuple[str, float, 
             "review_count": int(rating * 2000 + 1000),
             "url": _url(name, platform),
             "image_url": _img(keyword, name),
+            "source": "simulated",
+            "confidence": 0.0,
         })
     return results
 

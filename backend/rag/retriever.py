@@ -1,8 +1,8 @@
 """
 Hybrid retriever combining dense vector search with BM25 sparse retrieval.
 """
-from app.rag.embedder import embed_texts
-from app.rag.vector_store import search_similar
+from rag.embedder import embed_texts
+from rag.vector_store import search_similar
 
 
 async def hybrid_search(

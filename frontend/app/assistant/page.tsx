@@ -7,9 +7,16 @@ import {
   Heart, ExternalLink, Star
 } from 'lucide-react';
 import Link from 'next/link';
+import { Great_Vibes } from 'next/font/google';
 import { useChatStore, type SSEEvent, type ProductData } from '@/stores/chatStore';
 import { useAuthStore } from '@/stores/authStore';
 import { api } from '@/lib/api';
+
+const greatVibes = Great_Vibes({
+  weight: '400',
+  subsets: ['latin'],
+  display: 'swap',
+});
 
 const SUGGESTED_QUERIES = [
   "对比 iPhone 15 Pro Max 全网最低价",
@@ -420,7 +427,19 @@ export default function ChatStudio() {
             <div className="absolute top-0 right-0 p-3">
               <ShieldCheck size={16} className="text-indigo-500" />
             </div>
-            <div className="w-20 h-20 bg-gray-50 rounded-2xl mb-4" />
+            {/* EVA Logo — Great Vibes */}
+            <div className="relative w-20 h-20 mb-4 flex items-center justify-center">
+              {/* 光晕层 */}
+              <div className="absolute inset-0 rounded-2xl bg-gradient-to-br from-indigo-500/20 via-purple-500/10 to-sky-400/20 blur-md group-hover:blur-xl group-hover:scale-150 transition-all duration-700" />
+              {/* 背景 */}
+              <div className="absolute inset-0 rounded-2xl bg-gradient-to-br from-indigo-600 to-purple-700 shadow-lg shadow-indigo-200 group-hover:shadow-indigo-300 group-hover:shadow-xl transition-all duration-500" />
+              {/* 玻璃高光 */}
+              <div className="absolute top-0 left-0 right-0 h-1/2 rounded-t-2xl bg-gradient-to-b from-white/25 to-transparent" />
+              {/* 文字 */}
+              <span className={`${greatVibes.className} relative text-4xl text-white drop-shadow-[0_2px_4px_rgba(0,0,0,0.3)] group-hover:scale-110 transition-transform duration-500`}>
+                EV
+              </span>
+            </div>
             <h4 className="font-bold text-sm mb-1">Agent 工作流</h4>
             <p className="text-xs text-gray-400 leading-relaxed">
               Intent → Search → Review → Analysis → Report

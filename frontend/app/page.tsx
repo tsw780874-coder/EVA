@@ -198,19 +198,22 @@ export default function FashionHome() {
           </motion.div>
           <motion.div
             {...fadeInUp}
-            className="p-10 bg-white rounded-[40px] shadow-2xl shadow-indigo-100/50 border border-black/[0.03]"
+            whileHover={{ scale: 1.02 }}
+            className="rounded-[40px] shadow-2xl shadow-indigo-100/50 border border-white/20 overflow-hidden relative aspect-[4/3]"
           >
-            <div className="flex gap-2 mb-8">
-               <div className="w-3 h-3 rounded-full bg-red-400/20" />
-               <div className="w-3 h-3 rounded-full bg-yellow-400/20" />
-               <div className="w-3 h-3 rounded-full bg-green-400/20" />
-            </div>
-            <div className="space-y-4">
-               <div className="h-4 w-3/4 bg-gray-50 rounded" />
-               <div className="h-4 w-full bg-gray-50 rounded" />
-               <div className="h-20 w-full bg-indigo-50/30 rounded-2xl" />
-               <div className="h-4 w-1/2 bg-gray-50 rounded" />
-            </div>
+            <img
+              src="/music.jpg"
+              alt="Music visualization"
+              className="absolute inset-0 w-full h-full object-cover"
+            />
+            {/* 雾化层 */}
+            <div className="absolute inset-0 bg-gradient-to-br from-white/60 via-white/20 to-white/40" />
+            {/* 液态玻璃反射 */}
+            <div className="absolute -inset-1 bg-gradient-to-br from-white/30 via-transparent to-transparent" />
+            <div className="absolute top-0 left-0 right-0 h-1/3 bg-gradient-to-b from-white/40 to-transparent" />
+            <div className="absolute bottom-0 right-0 w-1/2 h-1/3 bg-gradient-to-tl from-white/30 to-transparent rounded-tl-[40px]" />
+            {/* 玻璃边框高光 */}
+            <div className="absolute inset-0 rounded-[40px] ring-1 ring-inset ring-white/50" />
           </motion.div>
         </div>
       </section>
@@ -241,7 +244,7 @@ export default function FashionHome() {
           <a href="#" className="hover:text-black">Weibo</a>
           <a href="#" className="hover:text-black">Developers</a>
         </div>
-        <p className="text-[10px] font-bold tracking-[0.4em] text-gray-300">EVA ENTERPRISE © 2024</p>
+        <p className="text-[10px] font-bold tracking-[0.4em] text-gray-300">EVA ENTERPRISE ©</p>
       </footer>
 
     </div>
