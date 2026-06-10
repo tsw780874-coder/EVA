@@ -1,4 +1,4 @@
-"""Agent service — SSE streaming wrapper (v4: perf timing + smart routing).
+"""Agent service — SSE streaming wrapper (v6: 5-layer search with progress events).
 
 Architecture:
   run_pipeline() is called in a background task.
@@ -7,7 +7,7 @@ Architecture:
   with the pipeline execution — so the frontend sees progressive
   output BEFORE the LLM call completes.
 
-v4: Includes perf timing breakdown in final SSE event.
+v6: Includes per-layer search progress events for the 5-layer strategy.
 """
 
 import asyncio
@@ -54,11 +54,13 @@ async def run_agent_stream(
         yield _sse({"type": "agent_progress", "agent": "analysis_pipeline", "message": "综合分析"})
         if result.get("final_report"):
             yield _sse({"type": "final_report", "markdown": result["final_report"]})
-        # Trust metadata (v5)
+        # Trust metadata (v6)
         yield _sse({"type": "trust", "confidence": result.get("confidence", 100),
                     "data_source": result.get("data_source", "llm"),
                     "citation": result.get("citation", ""),
-                    "warning": result.get("confidence_warning")})
+                    "warning": result.get("confidence_warning"),
+                    "search_layers": result.get("search_layers", []),
+                    "total_products": result.get("total_products_found", 0)})
         # Include perf timing
         if result.get("perf"):
             yield _sse({"type": "perf", "timing": result["perf"]})
@@ -100,26 +102,50 @@ async def run_agent_stream(
         return
 
     products = result.get("search_results", [])
+    search_layers = result.get("search_layers", [])
+    data_source = result.get("data_source", "unknown")
+
     if products:
+        # Emit per-layer progress for transparency
+        layer_names = {
+            "rag": "RAG知识库",
+            "product_cache": "商品缓存库",
+            "live_search": "电商平台实时搜索",
+            "similar_search": "相似商品匹配",
+            "template": "模板匹配",
+        }
+        for layer in search_layers:
+            label = layer_names.get(layer, layer)
+            yield _sse({"type": "agent_progress", "agent": "search_layer",
+                       "message": f"搜索层: {label}", "layer": layer})
+
         # Include source markers for transparency
         simulated_count = sum(1 for p in products if p.get("source") == "simulated")
         real_count = len(products) - simulated_count
         msg = f"找到 {len(products)} 个商品"
         if simulated_count > 0:
             msg += f"（{real_count}个真实数据，{simulated_count}个模拟数据）"
+        elif data_source == "similar":
+            msg += "（相似商品匹配）"
+        elif data_source == "cache":
+            msg += "（来自商品缓存）"
         yield _sse({"type": "agent_progress", "agent": "search_agent", "message": msg})
-        yield _sse({"type": "agent_result", "agent": "search_agent", "products": products})
+        yield _sse({"type": "agent_result", "agent": "search_agent",
+                   "products": products, "data_source": data_source,
+                   "search_layers": search_layers})
 
     yield _sse({"type": "agent_progress", "agent": "analysis_pipeline", "message": "综合分析"})
 
     if result.get("final_report"):
         yield _sse({"type": "final_report", "markdown": result["final_report"]})
 
-    # ── 7. Trustworthiness metadata (v5) ──
+    # ── 7. Trustworthiness metadata (v6) ──
     yield _sse({"type": "trust", "confidence": result.get("confidence", 0),
                 "data_source": result.get("data_source", "unknown"),
                 "citation": result.get("citation", ""),
-                "warning": result.get("confidence_warning")})
+                "warning": result.get("confidence_warning"),
+                "search_layers": result.get("search_layers", []),
+                "total_products": result.get("total_products_found", 0)})
 
     # ── 8. Perf timing ──
     if result.get("perf"):

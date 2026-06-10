@@ -19,6 +19,16 @@ _SHOPPING_KEYWORDS = [
     "耳机", "手机", "笔记本", "平板", "相机", "手表", "键盘", "鼠标",
     "显示器", "显卡", "游戏机", "音箱", "电视", "家电", "家具", "床垫",
     "美妆", "护肤", "香水", "鞋", "包", "灯", "Switch", "PS5",
+    "空调", "冰箱", "洗衣机", "扫地", "吸尘器",
+    # Sports equipment
+    "羽毛球拍", "羽球拍", "球拍", "羽毛球", "乒乓球", "网球拍",
+    "篮球", "足球", "跑步鞋", "跑鞋", "运动鞋",
+    "天斧", "弓箭", "疾光", "双刃", "龙牙", "雷霆", "神速",
+    # English brand names
+    "iPhone", "iPad", "MacBook", "AirPods", "Apple Watch",
+    "Galaxy", "ThinkPad", "XPS", "ROG", "PlayStation", "Xbox",
+    "RTX", "GeForce", "Radeon", "Ryzen", "Intel",
+    "YONEX", "yonex", "Victor", "Li-Ning", "Nike", "Adidas",
     # English
     "price", "compare", "cheap", "best", "buy", "deal", "discount",
     "shop", "purchase", "order", "recommend", "review", "rating",
@@ -53,10 +63,10 @@ def _classify(query: str) -> str:
     """Pure-keyword intent classification — zero latency, deterministic."""
     q = query.lower()
 
-    if any(kw in q for kw in _SHOPPING_KEYWORDS):
+    if any(kw.lower() in q for kw in _SHOPPING_KEYWORDS):
         return "shopping"
-    if any(kw in q for kw in _COMPLAINT_KEYWORDS):
+    if any(kw.lower() in q for kw in _COMPLAINT_KEYWORDS):
         return "complaint"
-    if any(kw in q for kw in _PRODUCT_QUERY_KEYWORDS):
+    if any(kw.lower() in q for kw in _PRODUCT_QUERY_KEYWORDS):
         return "product_query"
     return "general"
