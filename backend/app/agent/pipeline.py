@@ -607,8 +607,8 @@ async def run_pipeline(
         if intent_result.intent.value in ("trend_analysis", "recommend_products", "shopping_guide"):
             # Try quick hot product lookup for context
             try:
-                from app.agent.hot_products import get_trending_products
-                hot = await get_trending_products(top_k=5)
+                from app.agent.product_db import get_trending_products
+                hot = get_trending_products(top_k=5)
                 if hot:
                     context = "热门商品参考：\n" + "\n".join(
                         f"- {h['title']} ({h['brand']}, ¥{h['price_min']}-{h['price_max']})"
@@ -641,9 +641,9 @@ async def run_pipeline(
         # ── Layer 0: Hot Products Database (NEW — checked before RAG) ──
         timer.start("layer0_hot")
         try:
-            from app.agent.hot_products import search_hot_products
+            from app.agent.product_db import search_products as search_hot_products
             hot_products = await search_hot_products(
-                user_query, top_k=5, entity=entity if entity_category_ok else None,
+                user_query, top_k=5,
             )
             if hot_products:
                 # Normalize hot product fields (title → name)
@@ -675,9 +675,9 @@ async def run_pipeline(
                     canonical = trending_match["canonical"]
                     append_log("DEBUG", f"Trending normalization: '{user_query[:30]}' -> '{canonical[:30]}'")
                     # Try cache/hot with canonical query
-                    from app.agent.product_cache import search_product_cache
+                    from app.agent.product_db import search_products as search_product_cache
                     cache_from_trend = await search_product_cache(
-                        canonical, top_k=5, entity=entity if entity_category_ok else None,
+                        canonical, top_k=5,
                     )
                     if cache_from_trend:
                         products = [_enrich_product(p) for p in cache_from_trend]
@@ -704,16 +704,15 @@ async def run_pipeline(
         if not products:
             timer.start("layer2_cache")
             try:
-                from app.agent.product_cache import search_product_cache
+                from app.agent.product_db import search_products as search_product_cache
                 # Try original query first, then expanded variants
-                # Pass entity for constraint-based filtering
                 cache_products = await search_product_cache(
-                    user_query, top_k=5, entity=entity if entity_category_ok else None,
+                    user_query, top_k=5,
                 )
                 if not cache_products:
                     for variant in expanded_query.expanded[1:4]:
                         cache_products = await search_product_cache(
-                            variant, top_k=5, entity=entity if entity_category_ok else None,
+                            variant, top_k=5,
                         )
                         if cache_products:
                             break

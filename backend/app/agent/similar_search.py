@@ -105,7 +105,7 @@ async def _search_all_sources(
 
     # Source 1: Product cache
     try:
-        from app.agent.product_cache import search_product_cache
+        from app.agent.product_db import search_products as search_product_cache
         cache_results = await search_product_cache(query, top_k=top_k)
         for r in cache_results:
             r["search_layer"] = "product_cache"
@@ -253,11 +253,11 @@ async def similar_product_search(
         # Ultimate fallback: same category products
         try:
             if has_entity and entity.category and entity.category != "general":
-                from app.agent.product_cache import search_by_category
-                cat_results = await search_by_category(entity.category, top_k=5)
+                from app.agent.product_db import get_by_category as search_by_category
+                cat_results = search_by_category(entity.category, top_k=5)
             else:
-                from app.agent.product_cache import search_by_category
-                cat_results = await search_by_category(expanded.category, top_k=5)
+                from app.agent.product_db import get_by_category as search_by_category
+                cat_results = search_by_category(expanded.category, top_k=5)
             for r in cat_results:
                 r["degradation_level"] = 5
                 r["confidence"] = 15.0
@@ -294,7 +294,7 @@ async def find_at_least_one(
     """
     # Quick cache check first
     try:
-        from app.agent.product_cache import search_product_cache
+        from app.agent.product_db import search_products as search_product_cache
         cache_results = await search_product_cache(query, top_k=3, min_score=5.0)
         if cache_results:
             return cache_results
@@ -310,9 +310,9 @@ async def find_at_least_one(
     expanded = rewrite_query(query)
     if expanded.brands:
         try:
-            from app.agent.product_cache import search_by_brand
+            from app.agent.product_db import get_by_brand as search_by_brand
             for brand in expanded.brands:
-                brand_results = await search_by_brand(brand, top_k=3)
+                brand_results = search_by_brand(brand, top_k=3)
                 if brand_results:
                     for r in brand_results:
                         r["confidence"] = 10.0
@@ -324,8 +324,8 @@ async def find_at_least_one(
 
     # Ultimate ultimate: category search
     try:
-        from app.agent.product_cache import search_by_category
-        cat_results = await search_by_category(expanded.category, top_k=3)
+        from app.agent.product_db import get_by_category as search_by_category
+        cat_results = search_by_category(expanded.category, top_k=3)
         if cat_results:
             for r in cat_results:
                 r["confidence"] = 5.0
