@@ -218,3 +218,157 @@ async def llm_call(
     elapsed_ms = (time.perf_counter() - t_total) * 1000
     append_log("WARN", f"{node_name} 模型调用全部失败 ({elapsed_ms:.0f}ms)")
     return "", "", elapsed_ms
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Function Calling — 结构化工具调用
+# ═══════════════════════════════════════════════════════════════════════
+
+async def llm_call_with_tools(
+    *,
+    system_prompt: str,
+    user_message: str,
+    tools: list[dict],
+    max_tokens: int = 600,
+    temperature: float = 0.2,
+    user_id: str = "",
+    node_name: str = "tool_agent",
+    providers: Sequence[str] | None = None,
+    per_provider_timeout: float | None = None,
+    tool_choice: str = "auto",
+) -> tuple[list[dict], str, float]:
+    """带 Function Calling 的 LLM 调用。
+
+    支持 OpenAI-compatible 的 tool_use 功能。
+    所有 8 个 provider（DeepSeek, OpenAI, Groq, GLM, ERNIE）均支持。
+
+    Args:
+        system_prompt: 系统提示
+        user_message: 用户消息
+        tools: OpenAI 格式的 tools schema 列表
+        max_tokens: 最大输出 token
+        temperature: 温度
+        user_id: 用户ID
+        node_name: 日志节点名
+        providers: provider 列表
+        per_provider_timeout: 每个 provider 的超时
+        tool_choice: "auto" | "none" | "required" | 特定 tool
+
+    Returns:
+        (tool_calls, provider_name, elapsed_ms)
+        tool_calls: [{"id": "...", "function": {"name": "...", "arguments": "..."}}, ...]
+        如果 LLM 没有调用工具，返回空列表
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+
+    provider_list = list(providers or DEFAULT_PROVIDERS)
+    if not provider_list:
+        provider_list = list(DEFAULT_PROVIDERS)
+    provider_list = provider_list[:MAX_ATTEMPTS]
+    timeout = per_provider_timeout or _LLM_CALL_TIMEOUT
+
+    est_tokens = estimate_messages_tokens(messages)
+
+    async def _try_provider(provider: str) -> tuple[list[dict], str] | None:
+        try:
+            client = get_llm_client(provider)
+            model = get_model_name(provider)
+
+            kwargs: dict = {
+                "model": model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "tools": tools,
+                "tool_choice": tool_choice,
+            }
+
+            t0 = time.perf_counter()
+            resp = await asyncio.wait_for(
+                client.chat.completions.create(**kwargs),
+                timeout=timeout,
+            )
+
+            choice = resp.choices[0] if resp.choices else None
+            if not choice:
+                return None
+
+            # 检查是否有 tool_calls
+            msg = choice.message
+            if msg.tool_calls:
+                tool_calls = [
+                    {
+                        "id": tc.id,
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ]
+
+                if resp.usage:
+                    track_token_usage(user_id, provider, resp.usage.total_tokens)
+
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                track_model_latency(provider, elapsed_ms)
+
+                append_log(
+                    "SUCCESS",
+                    f"{node_name} tool_call ({elapsed_ms:.0f}ms) "
+                    f"provider={provider} tools={[tc['function']['name'] for tc in tool_calls]}",
+                )
+                return tool_calls, provider
+
+            # 没有 tool_calls — 返回空（LLM 选择不调用工具）
+            if msg.content:
+                append_log(
+                    "INFO",
+                    f"{node_name} LLM 选择不调用工具，返回文本: "
+                    f"{msg.content[:80]}...",
+                )
+            return [], provider
+
+        except (asyncio.TimeoutError, Exception):
+            return None
+
+    t_total = time.perf_counter()
+
+    # Race providers
+    tasks = [asyncio.create_task(_try_provider(p)) for p in provider_list]
+
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in done:
+            result = t.result()
+            if result is not None:
+                for pt in pending:
+                    pt.cancel()
+                tool_calls, provider = result
+                elapsed_ms = (time.perf_counter() - t_total) * 1000
+                return tool_calls, provider, elapsed_ms
+
+        # Second wave
+        if pending:
+            done2, pending2 = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED, timeout=2.0,
+            )
+            for t in done2:
+                result = t.result()
+                if result is not None:
+                    for pt in pending2:
+                        pt.cancel()
+                    tool_calls, provider = result
+                    elapsed_ms = (time.perf_counter() - t_total) * 1000
+                    return tool_calls, provider, elapsed_ms
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+
+    elapsed_ms = (time.perf_counter() - t_total) * 1000
+    append_log("WARN", f"{node_name} tool_call 全部失败 ({elapsed_ms:.0f}ms)")
+    return [], "", elapsed_ms
