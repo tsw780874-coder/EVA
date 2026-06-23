@@ -1,6 +1,11 @@
 """
 Milvus vector store wrapper for document storage and retrieval.
+
+v8 优化：同步 pymilvus 调用通过 run_in_executor 包装到线程池，
+避免阻塞 asyncio 事件循环。
 """
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from pymilvus import (
     connections, Collection, CollectionSchema,
@@ -11,6 +16,9 @@ from app.config import get_settings
 settings = get_settings()
 COLLECTION_NAME = "eva_knowledge"
 DIM = 1536  # text-embedding-3-small dimension
+
+# 共享线程池 — Milvus 同步调用在此执行
+_milvus_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="milvus")
 
 
 def _connect():
@@ -63,6 +71,12 @@ def insert_documents(documents: list[dict]):
     collection.flush()
 
 
+async def insert_documents_async(documents: list[dict]):
+    """异步插入文档 — 在线程池中运行同步 pymilvus 调用。"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_milvus_executor, insert_documents, documents)
+
+
 def search_similar(
     query_embedding: list[float],
     top_k: int = 5,
@@ -91,3 +105,30 @@ def search_similar(
         }
         for hit in results[0]
     ]
+
+
+async def search_similar_async(
+    query_embedding: list[float],
+    top_k: int = 5,
+    timeout: float = 2.0,
+) -> list[dict]:
+    """异步向量搜索 — 在线程池中运行同步 pymilvus 调用，带超时。
+
+    解决核心问题：pymilvus collection.search() 是同步调用，
+    在主事件循环中直接调用会阻塞所有其他协程。
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(
+                _milvus_executor,
+                search_similar,
+                query_embedding,
+                top_k,
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        from app.api.v1.admin import append_log
+        append_log("WARN", f"Milvus 搜索超时 ({timeout}s)")
+        return []

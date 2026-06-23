@@ -12,6 +12,7 @@ Key principles:
   5. NEVER fabricate price/stock/reviews. Mark simulated data clearly.
 """
 
+import asyncio
 import hashlib
 import json
 import re
@@ -635,100 +636,228 @@ async def run_pipeline(
 
     else:
         # ═══════════════════════════════════════════════════════════
-        # Shopping intent — 7-Layer Product Search (v6.1)
+        # Shopping intent — 并行搜索层 (v8 Fast Mode)
         # ═══════════════════════════════════════════════════════════
 
-        # ── Layer 0: Hot Products Database (NEW — checked before RAG) ──
-        timer.start("layer0_hot")
-        try:
-            from app.agent.product_db import search_products as search_hot_products
-            hot_products = await search_hot_products(
-                user_query, top_k=5,
+        # 检查是否启用快速并行搜索模式
+        from app.config import get_settings
+        settings = get_settings()
+        use_parallel = settings.pipeline_mode == "fast"
+
+        if use_parallel:
+            # ═══════════════════════════════════════════════════════
+            # v8 FAST MODE: Layer 0 + Layer 1 + Layer 2 并行执行
+            # 无数据依赖，任何一个成功即可返回
+            # ═══════════════════════════════════════════════════════
+            timer.start("parallel_layers")
+
+            async def _layer0_search():
+                """Layer 0: Hot Products Database"""
+                try:
+                    from app.agent.product_db import search_products as search_hot_products
+                    hot = await search_hot_products(user_query, top_k=5)
+                    if hot:
+                        normalized = []
+                        for hp in hot:
+                            hp["name"] = hp.get("title") or hp.get("name", "未知")
+                            hp.setdefault("price", (hp.get("price_min", 0) + hp.get("price_max", 0)) / 2)
+                            hp.setdefault("url", hp.get("product_url", ""))
+                            normalized.append(hp)
+                        result = [_enrich_product(p) for p in normalized]
+                        for p in result:
+                            p["source"] = p.get("source", "hot_products")
+                            p["popularity_score"] = p.get("popularity_score", 50)
+                        append_log("INFO", f"[Layer 0] 热门商品库命中: {len(result)}件")
+                        return ("hot_products", result)
+                except Exception as e:
+                    append_log("WARN", f"[Layer 0] 热门商品库异常: {str(e)[:80]}")
+                return ("hot_products", [])
+
+            async def _layer1_search():
+                """Layer 1: RAG Knowledge Base"""
+                try:
+                    r_products, r_docs = await rag_search_products(
+                        user_query, top_k=5, try_variants=False,  # 快速模式不试变体
+                    )
+                    if r_products:
+                        append_log("INFO", f"[Layer 1] RAG命中: {len(r_products)}件")
+                    return ("rag", r_products, r_docs)
+                except Exception as e:
+                    append_log("WARN", f"[Layer 1] RAG异常: {str(e)[:80]}")
+                return ("rag", [], [])
+
+            async def _layer2_search():
+                """Layer 2: Product Cache"""
+                try:
+                    from app.agent.product_db import search_products as search_product_cache
+                    cache = await search_product_cache(user_query, top_k=5)
+                    if cache:
+                        result = [_enrich_product(p) for p in cache]
+                        for p in result:
+                            p["source"] = p.get("source", "product_cache")
+                        append_log("INFO", f"[Layer 2] 商品缓存命中: {len(result)}件")
+                        return ("cache", result)
+                except Exception as e:
+                    append_log("WARN", f"[Layer 2] 商品缓存异常: {str(e)[:80]}")
+                return ("cache", [])
+
+            # 并行启动三层搜索
+            parallel_results = await asyncio.gather(
+                _layer0_search(),
+                _layer1_search(),
+                _layer2_search(),
+                return_exceptions=True,
             )
+
+            # 合并结果：按优先级 hot_products > rag > cache
+            l0_result = parallel_results[0] if not isinstance(parallel_results[0], Exception) else ("hot_products", [])
+            l1_result = parallel_results[1] if not isinstance(parallel_results[1], Exception) else ("rag", [], [])
+            l2_result = parallel_results[2] if not isinstance(parallel_results[2], Exception) else ("cache", [])
+
+            # Layer 0 结果
+            _, hot_products = l0_result
+            # Layer 1 结果
+            _, rag_prods, rag_docs_raw = l1_result
+            rag_docs = rag_docs_raw
+            # Layer 2 结果
+            _, cache_products = l2_result
+
+            # 优先级合并
             if hot_products:
-                # Normalize hot product fields (title → name)
-                normalized = []
-                for hp in hot_products:
-                    hp["name"] = hp.get("title") or hp.get("name", "未知")
-                    hp.setdefault("price", (hp.get("price_min", 0) + hp.get("price_max", 0)) / 2)
-                    hp.setdefault("url", hp.get("product_url", ""))
-                    normalized.append(hp)
-                products = [_enrich_product(p) for p in normalized]
-                for p in products:
-                    p["source"] = p.get("source", "hot_products")
-                    p["popularity_score"] = p.get("popularity_score", 50)
+                products = hot_products
                 source_type = "hot_products"
                 search_layers_used.append("hot_products")
-                review = {"verdict": "数据来自热门商品库", "pros": [], "cons": []}
-                append_log("INFO", f"[Layer 0] 热门商品库命中: {len(products)}件商品 "
-                          f"(entity={'on' if entity_category_ok else 'off'})")
-        except Exception as e:
-            append_log("WARN", f"[Layer 0] 热门商品库异常: {str(e)[:80]}")
-        timer.stop("layer0_hot")
-
-        # ── Layer 0.5: Trending Search Normalization ──
-        if not products:
-            try:
-                from app.agent.trending_searches import lookup_trending
-                trending_match = await lookup_trending(user_query)
-                if trending_match and trending_match.get("canonical") != user_query:
-                    canonical = trending_match["canonical"]
-                    append_log("DEBUG", f"Trending normalization: '{user_query[:30]}' -> '{canonical[:30]}'")
-                    # Try cache/hot with canonical query
-                    from app.agent.product_db import search_products as search_product_cache
-                    cache_from_trend = await search_product_cache(
-                        canonical, top_k=5,
+                review = {"verdict": "数据来自热门商品库（并行搜索）", "pros": [], "cons": []}
+            elif rag_prods:
+                products = rag_prods
+                source_type = "rag"
+                search_layers_used.append("rag")
+                review = {"verdict": "数据来自知识库（并行搜索）", "pros": [], "cons": []}
+            elif cache_products:
+                products = cache_products
+                source_type = "cache"
+                search_layers_used.append("product_cache")
+                review = {"verdict": "数据来自商品缓存（并行搜索）", "pros": [], "cons": []}
+            else:
+                # 并行搜索无结果，尝试RAG变体
+                try:
+                    rag_products_v, rag_docs_v = await rag_search_products(
+                        user_query, top_k=5, try_variants=True,
                     )
-                    if cache_from_trend:
-                        products = [_enrich_product(p) for p in cache_from_trend]
-                        source_type = "cache"
-                        search_layers_used.append("trending_normalize")
-                        review = {"verdict": "数据来自热门搜索匹配", "pros": [], "cons": []}
-                        append_log("INFO", f"[Layer 0.5] 热门搜索匹配: {len(products)}件商品")
-            except Exception:
-                pass
+                    if rag_products_v:
+                        products = rag_products_v
+                        rag_docs = rag_docs_v
+                        source_type = "rag"
+                        search_layers_used.append("rag_variants")
+                        review = {"verdict": "数据来自知识库（扩展查询）", "pros": [], "cons": []}
+                        append_log("INFO", f"[Layer 1 variants] RAG扩展命中: {len(products)}件")
+                except Exception:
+                    pass
 
-        # ── Layer 1: RAG Knowledge Base ──
-        timer.start("layer1_rag")
-        rag_products, rag_docs = await rag_search_products(user_query, top_k=5, try_variants=True)
-        timer.stop("layer1_rag")
+            timer.stop("parallel_layers")
 
-        if rag_products:
-            products = rag_products
-            source_type = "rag"
-            search_layers_used.append("rag")
-            review = {"verdict": "数据来自知识库", "pros": [], "cons": []}
-            append_log("INFO", f"[Layer 1] RAG命中: {len(products)}件商品")
+            # 记录并行搜索已使用的层
+            if hot_products:
+                search_layers_used.append("hot_products")
+            if rag_prods or products and source_type == "rag":
+                if "rag" not in search_layers_used:
+                    search_layers_used.append("rag")
+            if cache_products:
+                search_layers_used.append("product_cache")
 
-        # ── Layer 2: Product Cache ──
-        if not products:
-            timer.start("layer2_cache")
+        else:
+            # ═══════════════════════════════════════════════════════
+            # LEGACY MODE: 串行搜索层 (向后兼容)
+            # ═══════════════════════════════════════════════════════
+
+            # ── Layer 0: Hot Products Database ──
+            timer.start("layer0_hot")
             try:
-                from app.agent.product_db import search_products as search_product_cache
-                # Try original query first, then expanded variants
-                cache_products = await search_product_cache(
+                from app.agent.product_db import search_products as search_hot_products
+                hot_products = await search_hot_products(
                     user_query, top_k=5,
                 )
-                if not cache_products:
-                    for variant in expanded_query.expanded[1:4]:
-                        cache_products = await search_product_cache(
-                            variant, top_k=5,
-                        )
-                        if cache_products:
-                            break
-
-                if cache_products:
-                    products = [_enrich_product(p) for p in cache_products]
+                if hot_products:
+                    normalized = []
+                    for hp in hot_products:
+                        hp["name"] = hp.get("title") or hp.get("name", "未知")
+                        hp.setdefault("price", (hp.get("price_min", 0) + hp.get("price_max", 0)) / 2)
+                        hp.setdefault("url", hp.get("product_url", ""))
+                        normalized.append(hp)
+                    products = [_enrich_product(p) for p in normalized]
                     for p in products:
-                        p["source"] = p.get("source", "product_cache")
-                    source_type = "cache"
-                    search_layers_used.append("product_cache")
-                    review = {"verdict": "数据来自商品缓存", "pros": [], "cons": []}
-                    append_log("INFO", f"[Layer 2] 商品缓存命中: {len(products)}件商品 "
-                              f"(entity_filter={'on' if entity_category_ok else 'off'})")
+                        p["source"] = p.get("source", "hot_products")
+                        p["popularity_score"] = p.get("popularity_score", 50)
+                    source_type = "hot_products"
+                    search_layers_used.append("hot_products")
+                    review = {"verdict": "数据来自热门商品库", "pros": [], "cons": []}
+                    append_log("INFO", f"[Layer 0] 热门商品库命中: {len(products)}件商品 "
+                              f"(entity={'on' if entity_category_ok else 'off'})")
             except Exception as e:
-                append_log("WARN", f"[Layer 2] 商品缓存异常: {str(e)[:80]}")
-            timer.stop("layer2_cache")
+                append_log("WARN", f"[Layer 0] 热门商品库异常: {str(e)[:80]}")
+            timer.stop("layer0_hot")
+
+            # ── Layer 0.5: Trending Search Normalization ──
+            if not products:
+                try:
+                    from app.agent.trending_searches import lookup_trending
+                    trending_match = await lookup_trending(user_query)
+                    if trending_match and trending_match.get("canonical") != user_query:
+                        canonical = trending_match["canonical"]
+                        append_log("DEBUG", f"Trending normalization: '{user_query[:30]}' -> '{canonical[:30]}'")
+                        from app.agent.product_db import search_products as search_product_cache
+                        cache_from_trend = await search_product_cache(
+                            canonical, top_k=5,
+                        )
+                        if cache_from_trend:
+                            products = [_enrich_product(p) for p in cache_from_trend]
+                            source_type = "cache"
+                            search_layers_used.append("trending_normalize")
+                            review = {"verdict": "数据来自热门搜索匹配", "pros": [], "cons": []}
+                            append_log("INFO", f"[Layer 0.5] 热门搜索匹配: {len(products)}件商品")
+                except Exception:
+                    pass
+
+            # ── Layer 1: RAG Knowledge Base ──
+            timer.start("layer1_rag")
+            rag_products, rag_docs = await rag_search_products(user_query, top_k=5, try_variants=True)
+            timer.stop("layer1_rag")
+
+            if rag_products:
+                products = rag_products
+                source_type = "rag"
+                search_layers_used.append("rag")
+                review = {"verdict": "数据来自知识库", "pros": [], "cons": []}
+                append_log("INFO", f"[Layer 1] RAG命中: {len(products)}件商品")
+
+            # ── Layer 2: Product Cache ──
+            if not products:
+                timer.start("layer2_cache")
+                try:
+                    from app.agent.product_db import search_products as search_product_cache
+                    cache_products = await search_product_cache(
+                        user_query, top_k=5,
+                    )
+                    if not cache_products:
+                        for variant in expanded_query.expanded[1:4]:
+                            cache_products = await search_product_cache(
+                                variant, top_k=5,
+                            )
+                            if cache_products:
+                                break
+
+                    if cache_products:
+                        products = [_enrich_product(p) for p in cache_products]
+                        for p in products:
+                            p["source"] = p.get("source", "product_cache")
+                        source_type = "cache"
+                        search_layers_used.append("product_cache")
+                        review = {"verdict": "数据来自商品缓存", "pros": [], "cons": []}
+                        append_log("INFO", f"[Layer 2] 商品缓存命中: {len(products)}件商品 "
+                                  f"(entity_filter={'on' if entity_category_ok else 'off'})")
+                except Exception as e:
+                    append_log("WARN", f"[Layer 2] 商品缓存异常: {str(e)[:80]}")
+                timer.stop("layer2_cache")
 
         # ── Layer 3: Live E-commerce Search ──
         if not products:

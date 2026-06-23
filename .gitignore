@@ -30,6 +30,18 @@ node_modules/
 .next/
 out/
 
+# Database
+*.db
+
+# Cache
+.cache/
+
+# UV
+uv.lock
+
+# Claude local settings
+.claude/settings.local.json
+
 # Misc
 *.log
 .coverage

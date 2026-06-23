@@ -3,7 +3,7 @@
 提供：
   - 工具注册/查找
   - Function Calling schema 生成
-  - 并行工具执行
+  - 并行工具执行（含超时控制）
 
 用法:
     from app.tools.registry import registry, tool
@@ -20,10 +20,13 @@ import asyncio
 import time
 from collections.abc import Callable, Awaitable
 from app.tools.schema import ToolResult, ToolDefinition, ToolCategory, ToolStatus
-
+from app.config import get_settings
 
 # 工具执行函数签名
 ToolFunc = Callable[..., Awaitable[ToolResult]]
+
+# 默认超时（毫秒）
+DEFAULT_TOOL_TIMEOUT = 0.8  # 800ms
 
 
 class ToolRegistry:
@@ -81,9 +84,15 @@ class ToolRegistry:
     async def execute(
         self,
         name: str,
+        timeout: float | None = None,
         **kwargs,
     ) -> ToolResult:
-        """执行单个工具调用"""
+        """执行单个工具调用（含超时控制）。
+
+        Args:
+            name: 工具名称
+            timeout: 超时秒数，默认从配置读取 (tool_execution_timeout_ms / 1000)
+        """
         func = self._funcs.get(name)
         if not func:
             return ToolResult.failed(
@@ -91,11 +100,25 @@ class ToolRegistry:
                 error=f"未知工具: {name}。可用工具: {', '.join(self._tools.keys())}",
             )
 
+        # 读取超时配置
+        if timeout is None:
+            try:
+                settings = get_settings()
+                timeout = settings.tool_execution_timeout_ms / 1000.0
+            except Exception:
+                timeout = DEFAULT_TOOL_TIMEOUT
+
         t0 = time.perf_counter()
         try:
-            result = await func(**kwargs)
+            result = await asyncio.wait_for(func(**kwargs), timeout=timeout)
             result.latency_ms = (time.perf_counter() - t0) * 1000
             return result
+        except asyncio.TimeoutError:
+            return ToolResult.failed(
+                tool=name,
+                error=f"工具执行超时 ({timeout:.1f}s)",
+                latency_ms=(time.perf_counter() - t0) * 1000,
+            )
         except Exception as e:
             return ToolResult.failed(
                 tool=name,
@@ -107,12 +130,14 @@ class ToolRegistry:
         self,
         tool_calls: list[dict],
         max_concurrency: int = 8,
+        per_tool_timeout: float | None = None,
     ) -> dict[str, ToolResult]:
-        """并行执行多个工具调用
+        """并行执行多个工具调用（含超时控制）
 
         Args:
             tool_calls: [{"name": "product_search", "arguments": {...}}, ...]
             max_concurrency: 最大并发数
+            per_tool_timeout: 每个工具的超时秒数
 
         Returns:
             {tool_name: ToolResult}
@@ -129,7 +154,7 @@ class ToolRegistry:
                         args = json.loads(args)
                     except json.JSONDecodeError:
                         args = {}
-                result = await self.execute(name, **args)
+                result = await self.execute(name, timeout=per_tool_timeout, **args)
                 return name, result
 
         tasks = [bounded_execute(c) for c in tool_calls]

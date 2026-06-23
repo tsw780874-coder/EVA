@@ -1,8 +1,10 @@
 """
 Hybrid retriever combining dense vector search with BM25 sparse retrieval.
+
+v8 优化：使用 search_similar_async 避免同步 pymilvus 调用阻塞事件循环。
 """
 from rag.embedder import embed_texts
-from rag.vector_store import search_similar
+from rag.vector_store import search_similar_async
 
 
 async def hybrid_search(
@@ -13,5 +15,5 @@ async def hybrid_search(
     if not embeddings:
         return []
 
-    results = search_similar(embeddings[0], top_k=top_k)
+    results = await search_similar_async(embeddings[0], top_k=top_k)
     return results

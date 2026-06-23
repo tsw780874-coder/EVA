@@ -1,0 +1,51 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.egg
+*.log
+
+# ── Node ──
+node_modules/
+.next/
+out/
+
+# ── Git ──
+.git/
+.gitattributes
+.gitignore
+
+# ── IDE ──
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+
+# ── Env ──
+.env
+.env.local
+.env.*.local
+
+# ── Docker ──
+docker-data/
+
+# ── Claude ──
+.claude/
+CLAUDE.md
+memory/
+
+# ── Test ──
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── Misc ──
+*.tar.gz
+*.zip
+eva-deploy.tar.gz

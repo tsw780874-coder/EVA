@@ -136,11 +136,26 @@ async def llm_call(
                     timeout=timeout,
                 )
                 chunks: list[str] = []
+                buffer: list[str] = []
+                MIN_CHUNK_SIZE = 3  # 合并小块（至少3字符才发送回调）
+
                 async for chunk in resp:
                     delta = chunk.choices[0].delta if chunk.choices else None
                     if delta and delta.content:
                         chunks.append(delta.content)
-                        await stream_callback(delta.content)
+                        buffer.append(delta.content)
+                        # 缓冲足够大或遇到标点时才发送回调
+                        combined = "".join(buffer)
+                        if len(combined) >= MIN_CHUNK_SIZE or any(
+                            punct in combined for punct in ("。", "！", "？", "\n", "，", ".", "!", "?", ",")
+                        ):
+                            await stream_callback(combined)
+                            buffer.clear()
+
+                # 发送剩余缓冲
+                if buffer:
+                    await stream_callback("".join(buffer))
+
                 content = "".join(chunks)
             else:
                 resp = await asyncio.wait_for(

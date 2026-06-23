@@ -85,14 +85,15 @@ def is_safe_to_store(key: str, value: dict, source: str = "") -> bool:
 # L1: Short-term memory (Redis)
 # ═══════════════════════════════════════════════════════════════════════
 
-_redis: aioredis.Redis | None = None
-
-
 async def get_redis() -> aioredis.Redis:
-    global _redis
-    if _redis is None:
-        _redis = aioredis.from_url(settings.redis_url, decode_responses=True)
-    return _redis
+    """获取 Redis 客户端 — 使用统一连接池（来自 app.cache.redis_cache）。"""
+    from app.cache.redis_cache import get_redis_client
+    client = await get_redis_client()
+    if client is None:
+        # 回退到独立连接（统一池不可用时）
+        import redis.asyncio as aioredis
+        return await aioredis.from_url(settings.redis_url, decode_responses=True)
+    return client
 
 
 async def save_session_history(

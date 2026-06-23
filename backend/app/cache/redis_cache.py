@@ -70,16 +70,28 @@ async def _init_redis() -> bool:
             settings.redis_url or "redis://localhost:6379/0",
             socket_connect_timeout=1.0,
             socket_timeout=1.0,
+            socket_keepalive=True,
             decode_responses=True,
+            max_connections=20,  # 连接池大小
         )
         await _redis.ping()
         _redis_available = True
-        append_log("INFO", "Redis 缓存已连接")
+        append_log("INFO", "Redis 缓存已连接 (max_connections=20)")
     except Exception:
         _redis_available = False
         append_log("WARN", "Redis 不可用，使用内存缓存")
 
     return _redis_available
+
+
+async def get_redis_client():
+    """获取原始 Redis 客户端 — 供 memory_service 等模块统一使用。
+
+    所有模块应通过此函数获取 Redis 连接，避免创建多个连接池。
+    """
+    if await _init_redis():
+        return _redis
+    return None
 
 
 # ---------------------------------------------------------------------------

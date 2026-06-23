@@ -93,6 +93,29 @@ class Settings(BaseSettings):
         }
         return providers.get(self.default_llm_provider, providers["deepseek"])
 
+    # ============ 性能优化配置 ============
+    # Pipeline 模式: "fast" = 并行搜索 + LLM抢占 | "legacy" = v6串行模式
+    pipeline_mode: str = "fast"
+
+    # 超时配置 (毫秒)
+    pipeline_total_timeout_ms: int = 8000      # Pipeline 全局超时
+    tool_execution_timeout_ms: int = 800       # 单工具执行超时
+    llm_first_token_timeout_ms: int = 500      # LLM 首Token超时
+    rag_search_timeout_ms: int = 500           # RAG搜索超时
+
+    # 并行配置
+    max_concurrent_searches: int = 3           # 并行搜索层数
+    token_queue_size: int = 256                # Token 队列大小
+    token_poll_interval_ms: int = 40           # Token 轮询间隔
+
+    # 缓存配置
+    redis_cache_ttl: int = 300                 # Redis 缓存 TTL (秒)
+    bm25_index_cache_ttl: int = 60             # BM25 索引缓存 TTL (秒)
+
+    # 分级路由
+    enable_layered_routing: bool = True        # 启用 L1→L2→L3 分级查询
+    redis_first_layer: bool = True             # Redis 作为第一层入口
+
     # CORS
     cors_origins: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
 

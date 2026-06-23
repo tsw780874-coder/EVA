@@ -1,0 +1,117 @@
+version: "3.8"
+
+# EVA 极简部署 — 适用于 2GB 内存服务器
+# 4 服务: Nginx + Frontend + Backend(SQLite) + Redis
+# 移除: MySQL, Milvus/etcd/MinIO, MCP Server
+
+services:
+  # --- Nginx 反向代理（唯一对外入口）---
+  nginx:
+    image: nginx:alpine
+    container_name: eva-nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.light.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - eva-net
+    restart: unless-stopped
+    mem_limit: 64m
+
+  # --- Next.js 前端 ---
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - NODE_OPTIONS=--max-old-space-size=512
+    container_name: eva-frontend
+    environment:
+      - NEXT_PUBLIC_API_URL=
+      - NODE_OPTIONS=--max-old-space-size=512
+    depends_on:
+      - backend
+    networks:
+      - eva-net
+    restart: unless-stopped
+    mem_limit: 512m
+
+  # --- FastAPI 后端 (SQLite 模式) ---
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: eva-backend
+    environment:
+      # 使用 SQLite（无需 MySQL）
+      - USE_SQLITE=true
+      # Redis
+      - REDIS_URL=redis://redis:6379/0
+      # Milvus（禁用向量搜索）
+      - MILVUS_HOST=mock
+      - MILVUS_PORT=19530
+      # JWT
+      - JWT_SECRET=${JWT_SECRET:-eva-prod-secret-change-me}
+      # CORS（通过 Nginx 代理访问）
+      - CORS_ORIGINS=["http://39.96.65.233","http://localhost"]
+      # 默认 LLM 提供商
+      - DEFAULT_LLM_PROVIDER=${DEFAULT_LLM_PROVIDER:-deepseek}
+      # 1. DeepSeek（管理员主力）
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
+      # 2. OpenAI GPT-4o
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      # 3. 智谱 GLM-4-Flash
+      - GLM_FLASH_API_KEY=${GLM_FLASH_API_KEY:-}
+      - GLM_FLASH_MODEL=${GLM_FLASH_MODEL:-glm-4-flash}
+      - GLM_FLASH_BASE_URL=${GLM_FLASH_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}
+      # 4. 智谱 GLM-4.7-Flash
+      - GLM47_FLASH_API_KEY=${GLM47_FLASH_API_KEY:-}
+      - GLM47_FLASH_MODEL=${GLM47_FLASH_MODEL:-glm-4.7-flash}
+      - GLM47_FLASH_BASE_URL=${GLM47_FLASH_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}
+      # 5. 百度 ERNIE-Speed
+      - ERNIE_SPEED_API_KEY=${ERNIE_SPEED_API_KEY:-}
+      - ERNIE_SPEED_MODEL=${ERNIE_SPEED_MODEL:-ernie-speed-8k}
+      - ERNIE_SPEED_BASE_URL=${ERNIE_SPEED_BASE_URL:-https://qianfan.baidubce.com/v2}
+      # 6. 百度 ERNIE-3.5
+      - ERNIE35_API_KEY=${ERNIE35_API_KEY:-}
+      - ERNIE35_MODEL=${ERNIE35_MODEL:-ernie-3.5-8k}
+      - ERNIE35_BASE_URL=${ERNIE35_BASE_URL:-https://qianfan.baidubce.com/v2}
+      # 7. 火山引擎 Seedream（图像生成）
+      - SEEDREAM_API_KEY=${SEEDREAM_API_KEY:-}
+      # 8. Groq（极速推理 LPU）
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - GROQ_MODEL=${GROQ_MODEL:-llama-3.1-8b-instant}
+      - GROQ_BASE_URL=${GROQ_BASE_URL:-https://api.groq.com/openai/v1}
+    depends_on:
+      redis:
+        condition: service_started
+    networks:
+      - eva-net
+    restart: unless-stopped
+    mem_limit: 512m
+
+  # --- Redis 7 ---
+  redis:
+    image: redis:7-alpine
+    container_name: eva-redis
+    command: redis-server --maxmemory 64mb --maxmemory-policy allkeys-lru --save ""
+    volumes:
+      - redis-data:/data
+    networks:
+      - eva-net
+    restart: unless-stopped
+    mem_limit: 128m
+
+volumes:
+  redis-data:
+
+networks:
+  eva-net:
+    driver: bridge
