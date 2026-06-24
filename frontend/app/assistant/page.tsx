@@ -422,34 +422,46 @@ export default function ChatStudio() {
                 {products.map((p) => {
                   const isFaved = favoritedIds.has(p.id);
                   const isFaving = favoritingId === p.id;
-                  return (
+                  const hasUrl = p.url && p.url.length > 0;
+                  const hasImage = p.image_url && p.image_url.length > 0;
+                  const hasPrice = p.price && p.price > 0;
+
+                  const CardContent = (
                     <motion.div
                       key={p.id}
                       initial={{ opacity: 0, y: 12 }}
                       animate={{ opacity: 1, y: 0 }}
-                      className="bg-white border border-black/[0.06] rounded-2xl p-4 md:p-5 flex items-start gap-4 hover:shadow-lg hover:border-black/[0.12] transition-all group"
+                      className={`bg-white border border-black/[0.06] rounded-2xl p-4 md:p-5 flex items-start gap-4 hover:shadow-lg hover:border-black/[0.12] transition-all group ${hasUrl ? 'cursor-pointer' : ''}`}
                     >
-                      <div className="w-16 h-16 rounded-xl bg-gray-50 shrink-0 flex items-center justify-center overflow-hidden">
-                        {p.image_url ? (
+                      {/* 商品图片 — 真实图片 or 平台徽章回退 */}
+                      <div className="w-16 h-16 md:w-20 md:h-20 rounded-xl bg-gray-50 shrink-0 flex items-center justify-center overflow-hidden relative">
+                        {hasImage ? (
                           <img
                             src={p.image_url}
                             alt={p.name}
                             className="w-full h-full object-cover"
                             onError={(e) => {
-                              (e.target as HTMLImageElement).style.display = 'none';
-                              (e.target as HTMLImageElement).nextElementSibling?.classList.remove('hidden');
+                              const el = e.target as HTMLImageElement;
+                              el.style.display = 'none';
+                              const fallback = el.parentElement?.querySelector('.img-fallback');
+                              if (fallback) fallback.classList.remove('hidden');
                             }}
                           />
                         ) : null}
-                        <span className={`text-[10px] font-bold text-gray-400 ${p.image_url ? 'hidden' : ''}`}>
-                          {p.platform.slice(0, 2)}
-                        </span>
+                        <div className={`img-fallback w-full h-full flex flex-col items-center justify-center gap-1 ${hasImage ? 'hidden' : ''}`}>
+                          <span className={`text-xs font-bold ${platformColor(p.platform).split(' ')[1] || 'text-gray-500'}`}>
+                            {p.platform}
+                          </span>
+                          {p.rating && (
+                            <span className="text-[9px] text-gray-400">⭐{p.rating}</span>
+                          )}
+                        </div>
                       </div>
 
                       <div className="flex-1 min-w-0">
                         <div className="flex items-start justify-between gap-3">
                           <div>
-                            <h4 className="font-bold text-sm leading-snug">{p.name}</h4>
+                            <h4 className="font-bold text-sm leading-snug line-clamp-2">{p.name}</h4>
                             <div className="flex items-center gap-2 mt-1.5">
                               <span className={`px-2 py-0.5 rounded-full text-[9px] font-bold border ${platformColor(p.platform)}`}>
                                 {p.platform}
@@ -463,32 +475,37 @@ export default function ChatStudio() {
                             </div>
                           </div>
                           <div className="text-right shrink-0">
-                            <p className="text-xl font-black tracking-tight text-black">
-                              ¥{p.price?.toLocaleString()}
-                            </p>
-                            {p.original_price && p.original_price > p.price && (
-                              <p className="text-xs text-gray-400 line-through">
-                                ¥{p.original_price?.toLocaleString()}
-                              </p>
+                            {hasPrice ? (
+                              <>
+                                <p className="text-xl font-black tracking-tight text-black">
+                                  ¥{p.price?.toLocaleString()}
+                                </p>
+                                {p.original_price && p.original_price > (p.price || 0) && (
+                                  <p className="text-xs text-gray-400 line-through">
+                                    ¥{p.original_price?.toLocaleString()}
+                                  </p>
+                                )}
+                              </>
+                            ) : (
+                              <p className="text-sm font-bold text-gray-400">查看最新价</p>
                             )}
                           </div>
                         </div>
 
                         <div className="flex items-center gap-3 mt-3 pt-3 border-t border-black/[0.03]">
-                          {p.url && (
-                            <a
-                              href={p.url}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="flex items-center gap-1 text-[10px] font-bold text-gray-400 hover:text-black transition-colors"
-                            >
-                              <ExternalLink size={12} /> 查看商品
-                            </a>
+                          {hasUrl && (
+                            <span className="flex items-center gap-1 text-[10px] font-bold text-indigo-500 group-hover:text-indigo-700 transition-colors">
+                              <ExternalLink size={12} /> 点击卡片查看详情
+                            </span>
                           )}
                           <button
-                            onClick={() => handleFavorite(p)}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              e.preventDefault();
+                              handleFavorite(p);
+                            }}
                             disabled={isFaved || isFaving}
-                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[10px] font-bold transition-all ${
+                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[10px] font-bold transition-all ml-auto ${
                               isFaved
                                 ? "bg-red-50 text-red-500 border border-red-100"
                                 : "bg-gray-50 text-gray-500 border border-gray-100 hover:bg-red-50 hover:text-red-500 hover:border-red-100"
@@ -505,6 +522,23 @@ export default function ChatStudio() {
                       </div>
                     </motion.div>
                   );
+
+                  // 包装为可点击链接（仅当有 URL 时）
+                  if (hasUrl) {
+                    return (
+                      <a
+                        key={p.id}
+                        href={p.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="block"
+                        title={`在 ${p.platform} 查看 ${p.name}`}
+                      >
+                        {CardContent}
+                      </a>
+                    );
+                  }
+                  return CardContent;
                 })}
               </div>
             </div>

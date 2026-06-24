@@ -103,7 +103,8 @@
       "Bash(ls -la .venv/Scripts/python.exe)",
       "Bash(.venv/Scripts/python.exe --version)",
       "Bash(uv pip *)",
-      "Bash(uv venv *)"
+      "Bash(uv venv *)",
+      "Bash(.venv/Scripts/python -c \"import fastapi; print\\('FastAPI OK'\\)\")"
     ]
   }
 }

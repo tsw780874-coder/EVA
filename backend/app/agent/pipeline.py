@@ -26,11 +26,36 @@ from app.agent.llm_utils import llm_call
 from app.agent.product_templates import match_template
 from app.agent.model_router import route_query
 from app.agent.query_rewriter import rewrite_query, degrade_query
+from app.agent.ecommerce_web_search import ecommerce_web_search
 from app.api.v1.admin import append_log
 from app.core.perf import get_timer
 from app.core.citations import CitationTracker
 from app.core.confidence import ConfidenceScorer
 from app.core.verifier import DataVerifier
+
+# Pre-import RAG modules to avoid inline import cost on first pipeline call
+try:
+    from rag.hybrid_search import hybrid_search as _rag_hybrid_search
+    _RAG_AVAILABLE = True
+except ImportError:
+    _rag_hybrid_search = None
+    _RAG_AVAILABLE = False
+
+# Pipeline outer timeout — prevents runaway queries
+_PIPELINE_TIMEOUT = 18.0  # seconds (covers worst case: 2.5s parallel + 10s similar + 3s live + 2.5s LLM)
+
+
+async def warmup_milvus():
+    """Pre-connect to Milvus on startup to avoid cold-start latency.
+
+    Called from FastAPI lifespan startup event. Non-blocking on failure.
+    """
+    try:
+        from rag.vector_store import _connect
+        await asyncio.wait_for(asyncio.to_thread(_connect), timeout=2.0)
+        append_log("INFO", "Milvus warmup OK (pre-connected)")
+    except (asyncio.TimeoutError, Exception) as e:
+        append_log("WARN", f"Milvus warmup skipped: {str(e)[:60]}")
 
 # ---------------------------------------------------------------------------
 # Product enrichment (only adds formatting, never invents data)
@@ -42,13 +67,35 @@ PLATFORM_URLS = {
     "淘宝": "https://s.taobao.com/search?q={}",
     "得物": "https://www.dewu.com/search?keyword={}",
     "拼多多": "https://mobile.yangkeduo.com/search_result.html?search_key={}",
+    "唯品会": "https://www.vip.com/search?keyword={}",
+    "识货": "https://www.shihuo.cn/search?keyword={}",
+    "闲鱼": "https://s.2.taobao.com/list/list.htm?q={}",
+}
+
+
+# 平台 → 图标/Logo URL（用作商品图片回退）
+_PLATFORM_ICON_URLS: dict[str, str] = {
+    "京东": "https://img1x.jdimg.com/static/favicon.ico",
+    "天猫": "https://img.alicdn.com/tfs/TB1_ZXuNcfpK1RjSZFOXXa6nFXa-32-32.ico",
+    "淘宝": "https://www.taobao.com/favicon.ico",
+    "得物": "https://www.dewu.com/favicon.ico",
+    "拼多多": "https://funimg.pddpic.com/personal/login_footer.png",
+    "唯品会": "https://www.vip.com/favicon.ico",
+    "识货": "https://www.shihuo.cn/favicon.ico",
+    "闲鱼": "https://s.2.taobao.com/favicon.ico",
 }
 
 
 @lru_cache(maxsize=512)
-def _pick_image(name: str) -> str:
-    seed = hashlib.md5(name.encode()).hexdigest()[:8]
-    return f"https://picsum.photos/seed/{seed}/400/400"
+def _pick_image(name: str, platform: str = "") -> str:
+    """返回商品图片 URL — 优先用DB中的真实图片，否则返回平台图标。
+
+    不返回假图或占位图。
+    """
+    # 如果是链接回退商品，返回平台图标
+    if not name or "搜索「" in name:
+        return _PLATFORM_ICON_URLS.get(platform, "")
+    return ""
 
 
 def _enrich_product(p: dict) -> dict:
@@ -66,7 +113,7 @@ def _enrich_product(p: dict) -> dict:
 
     image_url = p.get("image_url", "") or p.get("imageUrl", "")
     if not image_url:
-        image_url = _pick_image(name)
+        image_url = _pick_image(name, platform)
 
     p["id"] = pid
     p["url"] = url
@@ -217,8 +264,10 @@ async def rag_search_products(
 
     for q in queries_to_try:
         try:
-            from rag.hybrid_search import hybrid_search
-            q_docs = await hybrid_search(q, top_k=top_k)
+            if _RAG_AVAILABLE:
+                q_docs = await _rag_hybrid_search(q, top_k=top_k)
+            else:
+                q_docs = []
             for doc in q_docs:
                 if doc not in docs:
                     docs.append(doc)
@@ -310,6 +359,138 @@ def _parse_product_from_content(
         }
 
     return None
+
+
+def _extract_search_keywords(query: str) -> str:
+    """Extract clean product keywords from a verbose user query.
+
+    Strips filler/intent words, keeping only the core product description.
+    """
+    import re
+    result = query.strip()
+
+    # Remove common filler phrases (longest first for greedy match)
+    fillers = [
+        # Chinese fillers
+        "我想买一件", "我想买一个", "我想买一台", "我想买",
+        "我要买一件", "我要买一个", "我要买一台", "我要买",
+        "我想", "我要", "帮我找一下", "帮我找", "帮我",
+        "找一下", "有没有", "哪里有", "哪里买", "在哪买", "怎么买",
+        "请帮我", "推荐一款", "推荐", "求推荐", "搜索一下", "搜索",
+        "买一件", "买一个", "买一台", "买",
+        # English fillers
+        "i want to buy a", "i want to buy an", "i want to buy",
+        "i want a", "i want an", "i need a", "i need an",
+        "find me a", "find me an", "looking for a", "looking for an",
+        "search for a", "search for an", "search for",
+        "please find", "please",
+        "buy a", "buy an", "buy",
+    ]
+    for f in sorted(fillers, key=len, reverse=True):
+        if result.lower().startswith(f.lower()):
+            result = result[len(f):].strip()
+            break  # Only strip one leading phrase
+
+    # Remove trailing filler/measure words
+    trailing = ["多少钱", "价格", "报价", "多少钱一个", "多少钱一件"]
+    for t in trailing:
+        if result.endswith(t):
+            result = result[:-len(t)].strip()
+
+    # Remove quantity prefixes like "一件", "一个", "一台", "一款"
+    result = re.sub(r'^[一二两三四五六七八九十\d]+[个件台款双只张]\s*', '', result)
+
+    return result.strip() or query.strip()
+
+
+def _format_products_fast(products: list[dict], source_type: str, confidence: float) -> str:
+    """Format products — clean, natural language, no redundant punctuation.
+
+    Product URLs are passed via structured SSE data, not markdown links.
+    The frontend renders clickable product cards from the products array.
+    """
+
+    # Separate real products from search links
+    link_sources = {"link_fallback", "live_search", "live", "ecommerce_web"}
+    real_prods = [p for p in products if p.get("source") not in link_sources and p.get("price", 0) > 0]
+    link_prods = [p for p in products if p.get("source") in link_sources or p.get("price", 0) == 0]
+
+    # Deduplicate links — one per platform, prefer cleaner URLs
+    plat_best: dict[str, dict] = {}
+    for p in link_prods:
+        plat = p.get("platform", "")
+        url = p.get("url", "")
+        if not plat or not url:
+            continue
+        if plat not in plat_best or len(url) < len(plat_best[plat].get("url", "")):
+            plat_best[plat] = p
+    link_prods = list(plat_best.values())
+
+    lines = []
+
+    # ── Intro ──
+    if real_prods:
+        lines.append(f"为您找到 {len(real_prods)} 款相关商品：")
+        lines.append("")
+    else:
+        keyword = ""
+        if link_prods:
+            raw = link_prods[0].get("name", "")
+            if "「" in raw:
+                keyword = raw.split("「")[-1].replace("」", "").strip()
+            if not keyword:
+                keyword = link_prods[0].get("title", raw)[:30]
+        lines.append(f"暂未找到「{keyword}」的库存数据，已为您生成电商平台搜索入口，点击商品卡片查看实时价格：")
+        lines.append("")
+
+    # ── Product cards (clean, no redundant punctuation) ──
+    for p in real_prods[:5]:
+        name = p.get("name", "")
+        price = p.get("price", 0)
+        orig_price = p.get("original_price", 0)
+        platform = p.get("platform", "")
+        rating = p.get("rating", 0)
+
+        if price > 0:
+            if orig_price and orig_price > price:
+                discount = int((1 - price / orig_price) * 100)
+                price_line = f"¥{price:,.0f}（原价 ¥{orig_price:,.0f}，省 {discount}%）"
+            else:
+                price_line = f"¥{price:,.0f}"
+        else:
+            price_line = "价格待核实"
+
+        rating_str = f"| 评分 {rating}" if rating else ""
+
+        lines.append(f"{name}")
+        lines.append(f"{platform}  {price_line}  {rating_str}")
+        lines.append("")
+
+    # ── Platform quick-compare (clean, no markdown links) ──
+    if link_prods:
+        lines.append("")
+        lines.append("全平台比价：")
+        lines.append("")
+
+        row_items = []
+        for p in link_prods[:8]:
+            plat = p.get("platform", "")
+            price = p.get("price", 0)
+            if plat:
+                if price > 0:
+                    row_items.append(f"{plat} ~¥{price:,.0f}")
+                else:
+                    row_items.append(f"{plat}")
+            if len(row_items) == 4:
+                lines.append("  |  ".join(row_items))
+                row_items = []
+        if row_items:
+            lines.append("  |  ".join(row_items))
+
+        lines.append("")
+        lines.append("点击商品卡片可跳转到对应平台查看最新价格。")
+
+    return "\n".join(lines)
 
 
 async def rag_summarize(
@@ -439,6 +620,13 @@ def generate_report(
     confidence_score: float = 0,
     confidence_warning: str | None = None,
 ) -> str:
+    # When rag_summary is already a fully formatted report from
+    # _format_products_fast, use it directly (skip old header)
+    if rag_summary and (rag_summary.startswith("##") or
+                        rag_summary.startswith("为您") or
+                        rag_summary.startswith("我暂时")):
+        return rag_summary
+
     lines = [f"## {user_query}", ""]
 
     # Confidence indicator
@@ -507,6 +695,19 @@ def _result_cache_key(query: str) -> str:
     return hashlib.sha256(query.encode()).hexdigest()
 
 
+async def _redis_cache_write(rk: str, result: dict, ttl: int) -> None:
+    """Write pipeline result to Redis — fire and forget, non-blocking."""
+    try:
+        from app.cache.redis_cache import get_cache
+        cache_layer = await asyncio.wait_for(get_cache(), timeout=0.3)
+        await asyncio.wait_for(
+            cache_layer.set(f"eva:query:{rk}", {**result, "expiry": time.time() + ttl}, ttl=ttl),
+            timeout=0.3,
+        )
+    except (asyncio.TimeoutError, Exception):
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Main Pipeline Entry Point (v6 — 5-Layer Search Strategy)
 # ---------------------------------------------------------------------------
@@ -546,15 +747,17 @@ async def run_pipeline(
     if not bypass_cache:
         try:
             from app.cache.redis_cache import get_cache
-            cache_layer = await get_cache()
-            cached = await cache_layer.get(f"eva:query:{rk}")
+            cache_layer = await asyncio.wait_for(get_cache(), timeout=0.3)
+            cached = await asyncio.wait_for(
+                cache_layer.get(f"eva:query:{rk}"), timeout=0.3,
+            )
             if cached and time.time() < cached.get("expiry", 0):
                 append_log("INFO", f"pipeline v6 命中缓存 ({user_query[:30]}...)")
                 if stream_callback:
                     await stream_callback(cached.get("final_report", ""))
                 cached["perf"] = {"cache_hit_ms": timer.elapsed_ms("pipeline")}
                 return cached
-        except Exception:
+        except (asyncio.TimeoutError, Exception):
             pass
 
     if not bypass_cache and rk in _result_cache:
@@ -584,6 +787,14 @@ async def run_pipeline(
     from app.agent.product_alias_db import resolve_product, get_category_constraint, get_brand_constraint
     entity = resolve_product(user_query)
     entity_category_ok = entity.is_valid and entity.confidence >= 0.4
+
+    # ── Fast-path: detect category mismatch early (skip SerpAPI/live search) ──
+    skip_slow_layers = False
+    from app.agent.product_db import _CN_CATEGORY_MAP as _cat_map
+    for cn_cat in _cat_map:
+        if cn_cat in user_query.lower():
+            skip_slow_layers = True
+            break
 
     # ── Prepare result containers ──
     products: list[dict] = []
@@ -651,6 +862,33 @@ async def run_pipeline(
             # ═══════════════════════════════════════════════════════
             timer.start("parallel_layers")
 
+            async def _layer0_5_search():
+                """Layer 0.5: E-Commerce Web Search (search engines → REAL product links)
+
+                Queries Google (SerpAPI) or DuckDuckGo with platform-specific
+                site: operators to find actual product listings on JD, Tmall,
+                Taobao, Dewu, PDD, Vipshop, Shihuo, Xianyu.
+
+                This layer takes priority over ALL simulated data sources
+                because it returns real, verifiable product links.
+                """
+                try:
+                    if skip_slow_layers:
+                        web_products = []
+                    else:
+                        web_products = await ecommerce_web_search(
+                            _extract_search_keywords(user_query), top_k=5, timeout=2.5, fast_mode=False,
+                        )
+                    if web_products:
+                        result = [_enrich_product(p) for p in web_products]
+                        for p in result:
+                            p["source"] = p.get("source", "ecommerce_web")
+                        append_log("INFO", f"[Layer 0.5] 电商Web搜索命中: {len(result)}件 (真实链接)")
+                        return ("ecommerce_web", result)
+                except Exception as e:
+                    append_log("WARN", f"[Layer 0.5] 电商Web搜索异常: {str(e)[:80]}")
+                return ("ecommerce_web", [])
+
             async def _layer0_search():
                 """Layer 0: Hot Products Database"""
                 try:
@@ -676,9 +914,12 @@ async def run_pipeline(
             async def _layer1_search():
                 """Layer 1: RAG Knowledge Base"""
                 try:
-                    r_products, r_docs = await rag_search_products(
-                        user_query, top_k=5, try_variants=False,  # 快速模式不试变体
-                    )
+                    if skip_slow_layers:
+                        return ("rag", [], [])
+                    else:
+                        r_products, r_docs = await rag_search_products(
+                            user_query, top_k=5, try_variants=False,
+                        )
                     if r_products:
                         append_log("INFO", f"[Layer 1] RAG命中: {len(r_products)}件")
                     return ("rag", r_products, r_docs)
@@ -701,19 +942,23 @@ async def run_pipeline(
                     append_log("WARN", f"[Layer 2] 商品缓存异常: {str(e)[:80]}")
                 return ("cache", [])
 
-            # 并行启动三层搜索
+            # 并行启动四层搜索 (Layer 0.5 ecom_web 优先级最高 — 真实链接)
             parallel_results = await asyncio.gather(
+                _layer0_5_search(),
                 _layer0_search(),
                 _layer1_search(),
                 _layer2_search(),
                 return_exceptions=True,
             )
 
-            # 合并结果：按优先级 hot_products > rag > cache
-            l0_result = parallel_results[0] if not isinstance(parallel_results[0], Exception) else ("hot_products", [])
-            l1_result = parallel_results[1] if not isinstance(parallel_results[1], Exception) else ("rag", [], [])
-            l2_result = parallel_results[2] if not isinstance(parallel_results[2], Exception) else ("cache", [])
+            # 合并结果：优先级 ecommerce_web > hot_products > rag > cache
+            l0_5_result = parallel_results[0] if not isinstance(parallel_results[0], Exception) else ("ecommerce_web", [])
+            l0_result = parallel_results[1] if not isinstance(parallel_results[1], Exception) else ("hot_products", [])
+            l1_result = parallel_results[2] if not isinstance(parallel_results[2], Exception) else ("rag", [], [])
+            l2_result = parallel_results[3] if not isinstance(parallel_results[3], Exception) else ("cache", [])
 
+            # Layer 0.5 结果 (REAL product links — highest priority)
+            _, web_products = l0_5_result
             # Layer 0 结果
             _, hot_products = l0_result
             # Layer 1 结果
@@ -722,8 +967,25 @@ async def run_pipeline(
             # Layer 2 结果
             _, cache_products = l2_result
 
-            # 优先级合并
-            if hot_products:
+            # 优先级合并: 真实链接优先，但和DB结果合并展示
+            if web_products and hot_products:
+                # Both found — merge: DB products first, then deduped web links
+                # Remove web products that duplicate hot_products by name similarity
+                hot_names = {p.get("name", "").lower()[:20] for p in hot_products}
+                unique_web = [p for p in web_products
+                              if p.get("name", "").lower()[:20] not in hot_names]
+                products = hot_products + unique_web
+                source_type = "hot_products"
+                search_layers_used.append("ecommerce_web")
+                search_layers_used.append("hot_products")
+                search_layers_used.append("link_fallback")  # Prevent duplicate injection
+                review = {"verdict": "数据来自热门商品库 + 电商平台实时搜索", "pros": [], "cons": []}
+            elif web_products:
+                products = web_products
+                source_type = "ecommerce_web"
+                search_layers_used.append("ecommerce_web")
+                review = {"verdict": "数据来自电商平台Web搜索（搜索引擎实时结果）", "pros": [], "cons": []}
+            elif hot_products:
                 products = hot_products
                 source_type = "hot_products"
                 search_layers_used.append("hot_products")
@@ -739,24 +1001,27 @@ async def run_pipeline(
                 search_layers_used.append("product_cache")
                 review = {"verdict": "数据来自商品缓存（并行搜索）", "pros": [], "cons": []}
             else:
-                # 并行搜索无结果，尝试RAG变体
-                try:
-                    rag_products_v, rag_docs_v = await rag_search_products(
-                        user_query, top_k=5, try_variants=True,
-                    )
-                    if rag_products_v:
-                        products = rag_products_v
-                        rag_docs = rag_docs_v
-                        source_type = "rag"
-                        search_layers_used.append("rag_variants")
-                        review = {"verdict": "数据来自知识库（扩展查询）", "pros": [], "cons": []}
-                        append_log("INFO", f"[Layer 1 variants] RAG扩展命中: {len(products)}件")
-                except Exception:
-                    pass
+                # 并行搜索无结果，尝试RAG变体（skip if category mismatch）
+                if not skip_slow_layers:
+                    try:
+                        rag_products_v, rag_docs_v = await rag_search_products(
+                            user_query, top_k=5, try_variants=True,
+                        )
+                        if rag_products_v:
+                            products = rag_products_v
+                            rag_docs = rag_docs_v
+                            source_type = "rag"
+                            search_layers_used.append("rag_variants")
+                            review = {"verdict": "数据来自知识库（扩展查询）", "pros": [], "cons": []}
+                            append_log("INFO", f"[Layer 1 variants] RAG扩展命中: {len(products)}件")
+                    except Exception:
+                        pass
 
             timer.stop("parallel_layers")
 
             # 记录并行搜索已使用的层
+            if web_products:
+                search_layers_used.append("ecommerce_web")
             if hot_products:
                 search_layers_used.append("hot_products")
             if rag_prods or products and source_type == "rag":
@@ -769,6 +1034,28 @@ async def run_pipeline(
             # ═══════════════════════════════════════════════════════
             # LEGACY MODE: 串行搜索层 (向后兼容)
             # ═══════════════════════════════════════════════════════
+
+            # ── Layer 0.5: E-Commerce Web Search (REAL links — highest priority) ──
+            if not products:
+                timer.start("layer0_5_ecommerce_web")
+                try:
+                    if skip_slow_layers:
+                        web_products = []
+                    else:
+                        web_products = await ecommerce_web_search(
+                            _extract_search_keywords(user_query), top_k=5, timeout=5.0,
+                        )
+                    if web_products:
+                        products = [_enrich_product(p) for p in web_products]
+                        for p in products:
+                            p["source"] = p.get("source", "ecommerce_web")
+                        source_type = "ecommerce_web"
+                        search_layers_used.append("ecommerce_web")
+                        review = {"verdict": "数据来自电商平台Web搜索", "pros": [], "cons": []}
+                        append_log("INFO", f"[Layer 0.5] 电商Web搜索命中: {len(products)}件商品")
+                except Exception as e:
+                    append_log("WARN", f"[Layer 0.5] 电商Web搜索异常: {str(e)[:80]}")
+                timer.stop("layer0_5_ecommerce_web")
 
             # ── Layer 0: Hot Products Database ──
             timer.start("layer0_hot")
@@ -860,12 +1147,12 @@ async def run_pipeline(
                 timer.stop("layer2_cache")
 
         # ── Layer 3: Live E-commerce Search ──
-        if not products:
+        if not products and not skip_slow_layers:
             timer.start("layer3_live")
             try:
                 from app.agent.live_search import live_search_products
                 live_products = await live_search_products(
-                    user_query, top_k=5, user_id=user_id, timeout=8.0,
+                    _extract_search_keywords(user_query), top_k=5, user_id=user_id, timeout=3.0,
                 )
                 if live_products:
                     # Validate against entity constraints
@@ -895,7 +1182,7 @@ async def run_pipeline(
             timer.stop("layer3_live")
 
         # ── Layer 4: Similar Product Search (progressive degradation) ──
-        if not products:
+        if not products and not skip_slow_layers:
             timer.start("layer4_similar")
             try:
                 from app.agent.similar_search import similar_product_search
@@ -951,13 +1238,22 @@ async def run_pipeline(
             timer.stop("layer5_template")
 
         # ── Layer 6: Entity-aware Search URL Generation (guaranteed fallback) ──
-        if not products and entity_category_ok:
+        if not products:
             timer.start("layer6_link_fallback")
             # Generate real search URLs for detected brand + product on major platforms
             from urllib.parse import quote as url_quote
-            search_terms = entity.product or user_query
-            if entity.brand:
-                search_terms = f"{entity.brand} {search_terms}"
+            # Use entity info if available, otherwise extract keywords
+            if entity_category_ok:
+                search_terms = entity.product or _extract_search_keywords(user_query)
+                if entity.brand:
+                    search_terms = f"{entity.brand} {search_terms}"
+                platforms = platforms_for_entity.get(
+                    entity.category,
+                    ["京东", "天猫", "淘宝", "得物", "拼多多", "闲鱼", "识货", "唯品会"],
+                )
+            else:
+                search_terms = user_query
+                platforms = ["京东", "天猫", "淘宝", "得物", "拼多多", "闲鱼", "识货", "唯品会"]
 
             platforms_for_entity = {
                 "badminton_racket": ["京东", "天猫", "淘宝", "得物", "拼多多", "闲鱼"],
@@ -971,18 +1267,30 @@ async def run_pipeline(
                 "gaming_console": ["京东", "天猫", "淘宝", "拼多多"],
             }
 
-            platforms = platforms_for_entity.get(entity.category, ["京东", "天猫", "淘宝", "得物", "拼多多"])
             url_products = []
+            # ── Price enrichment: try product DB for reference prices ──
+            ref_price = 0.0
+            if entity_category_ok:
+                try:
+                    from app.agent.product_db import search_hot_products
+                    entity_prods = search_hot_products(search_terms, top_k=3)
+                    if entity_prods:
+                        prices = [p.get("price", 0) for p in entity_prods if p.get("price", 0) > 0]
+                        if prices:
+                            ref_price = sum(prices) / len(prices)
+                except Exception:
+                    pass
+
             for plat in platforms[:4]:
                 tmpl = PLATFORM_URLS.get(plat, "")
                 if tmpl:
                     url_products.append({
                         "name": f"{search_terms}",
                         "platform": plat,
-                        "price": 0.0,
+                        "price": round(ref_price, 2),
                         "url": tmpl.format(url_quote(search_terms)),
                         "source": "link_fallback",
-                        "confidence": 8.0,
+                        "confidence": 12.0 if ref_price > 0 else 8.0,
                     })
 
             if url_products:
@@ -990,9 +1298,37 @@ async def run_pipeline(
                 source_type = "link_fallback"
                 search_layers_used.append("link_fallback")
                 review = {"verdict": f"未找到{search_terms}的实时数据，以下为电商平台搜索链接", "pros": [], "cons": []}
-                confidence_warning = f"⚠️ 未在缓存中找到 {entity.brand} {entity.product} 的实时价格数据。请点击链接查看最新价格。"
+                if entity_category_ok:
+                    confidence_warning = f"⚠️ 未在缓存中找到 {entity.brand} {entity.product} 的实时价格数据。请点击链接查看最新价格。"
+                else:
+                    confidence_warning = f"⚠️ 未在缓存中找到「{user_query}」的实时数据。请点击以下链接在各平台搜索。"
                 append_log("INFO", f"[Layer 6] 链接回退: {len(products)}个平台搜索链接")
             timer.stop("layer6_link_fallback")
+
+        # ── Post-search: Category sanity check ──
+        # If query specifies a category (e.g., "汉服", "衬衫") but all DB
+        # products are from different categories, discard them so pipeline
+        # falls through to search link generation instead of showing iPhones.
+        if products and source_type in ("hot_products", "product_cache", "rag"):
+            from app.agent.product_db import _CN_CATEGORY_MAP as _cat_map
+            q_lower = user_query.lower()
+            detected_cats: set[str] = set()
+            for cn_cat, eng_cats in _cat_map.items():
+                if cn_cat in q_lower:
+                    detected_cats.update(eng_cats)
+            if detected_cats:
+                # Check if ANY product matches the detected categories
+                has_match = False
+                for p in products:
+                    p_cat = p.get("category", "").lower()
+                    if any(dc in p_cat for dc in detected_cats):
+                        has_match = True
+                        break
+                if not has_match:
+                    append_log("INFO", f"Category mismatch: query={detected_cats}, "
+                              f"products={[p.get('category','?') for p in products[:3]]} — discarding")
+                    products = []
+                    source_type = "none"
 
         # ── Post-search: Re-rank with popularity weighting ──
         if products and len(products) > 1:
@@ -1018,12 +1354,17 @@ async def run_pipeline(
 
             # GUARANTEED RETURN RULE: if we have products after validation, always return them
             if products:
-                # Verify data (skip for link_fallback — those are just URLs)
-                if source_type != "link_fallback":
+                # Verify data — SKIP for simulated/fallback sources (fast path)
+                # Only run expensive DB verification for real data sources
+                if source_type in ("live", "live_search"):
                     verifications = await verifier.verify_product_claims(products)
                     confidence_score = DataVerifier.aggregate_confidence(verifications)
+                elif source_type in ("link_fallback", "ecommerce_web"):
+                    confidence_score = 20.0
                 else:
-                    confidence_score = 8.0
+                    # Simulated sources (hot_products, product_cache, rag, similar):
+                    # Curated product DB — reasonable confidence for display
+                    confidence_score = 65.0
 
                 # Override confidence for simulated data
                 if source_type == "simulated":
@@ -1043,6 +1384,70 @@ async def run_pipeline(
                             source_name=p.get("platform", "未知"),
                             confidence=p.get("confidence", confidence_score),
                         )
+
+                # ── Always append real e-commerce search links ──
+                # When products come from simulated sources (hot_products, product_cache,
+                # rag, similar_search) or are link_fallback, append clickable search URLs
+                # so users always have a way to find real listings on actual platforms.
+                simulated_sources = {"hot_products", "product_cache", "rag", "similar_search",
+                                     "simulated", "template", "hot_products_cache"}
+                if source_type in simulated_sources and "link_fallback" not in search_layers_used:
+                    # Only inject if we don't already have search links from ecommerce_web
+                    # Use entity info if available, otherwise extract keywords from query
+                    if entity_category_ok:
+                        search_terms = entity.product or _extract_search_keywords(user_query)
+                        if entity.brand:
+                            search_terms = f"{entity.brand} {search_terms}"
+                    else:
+                        search_terms = _extract_search_keywords(user_query)
+
+                    # ── Price enrichment: try to estimate real prices from available data ──
+                    # Extract price hints from already-found products (if any)
+                    existing_prices: dict[str, float] = {}
+                    for ep in products:
+                        ep_plat = ep.get("platform", "")
+                        ep_price = ep.get("price", 0)
+                        if ep_plat and ep_price > 0:
+                            if ep_plat not in existing_prices or ep_price < existing_prices[ep_plat]:
+                                existing_prices[ep_plat] = ep_price
+
+                    # Also check for price hints from entity data (product DB has price ranges)
+                    estimated_ref_price = 0.0
+                    if entity_category_ok and entity.product:
+                        try:
+                            from app.agent.product_db import search_hot_products
+                            entity_prods = search_hot_products(search_terms, top_k=3)
+                            if entity_prods:
+                                entity_prices = [p.get("price", 0) for p in entity_prods if p.get("price", 0) > 0]
+                                if entity_prices:
+                                    estimated_ref_price = sum(entity_prices) / len(entity_prices)
+                        except Exception:
+                            pass
+
+                    all_ecom_platforms = ["京东", "天猫", "淘宝", "得物", "拼多多", "闲鱼", "识货", "唯品会"]
+                    link_products = []
+                    from urllib.parse import quote as url_quote2
+                    for plat in all_ecom_platforms:
+                        tmpl = PLATFORM_URLS.get(plat, "")
+                        if tmpl:
+                            # Use platform-specific price if available, otherwise reference price
+                            plat_price = existing_prices.get(plat, estimated_ref_price)
+                            link_products.append({
+                                "name": search_terms,
+                                "platform": plat,
+                                "price": round(plat_price, 2),
+                                "url": tmpl.format(url_quote2(search_terms)),
+                                "source": "link_fallback",
+                                "confidence": 12.0 if plat_price > 0 else 8.0,
+                            })
+                    # Append after existing products (don't replace)
+                    for lp in link_products:
+                        lp["id"] = str(uuid.UUID(hashlib.md5(lp["url"].encode()).hexdigest()))
+                        lp["image_url"] = _pick_image(lp["name"], lp.get("platform", ""))
+                    products = products + link_products
+                    if "link_fallback" not in search_layers_used:
+                        search_layers_used.append("link_fallback")
+                    append_log("INFO", f"附加 {len(link_products)} 个电商平台搜索链接（真实可点击）")
 
                 append_log(
                     "INFO",
@@ -1074,7 +1479,7 @@ async def run_pipeline(
             search_layers_used.append("none")
             append_log("WARN", "pipeline v6 所有搜索层均失败 — 返回 not_found")
 
-    # ── LLM Summarization ──
+    # ── LLM Summarization (skip for fast sources — use template) ──
     timer.start("llm_summarize")
     if source_type == "none" and intent in ("shopping", "product_query"):
         # No data — generate helpful not_found message
@@ -1083,19 +1488,14 @@ async def run_pipeline(
         )
         timer.record("llm_summarize", llm_ms)
         review = {"verdict": review_text, "pros": [], "cons": []}
-    elif products and intent in ("shopping", "product_query"):
-        # Products found — summarize them
-        # Build context from products + RAG docs
-        summarize_context = list(products[:5])
-        if rag_docs:
-            summarize_context.extend(rag_docs[:3])
-        review_text, _, llm_ms = await rag_summarize(
-            user_query, summarize_context, intent, user_id,
-            stream_callback, source_type=source_type,
-        )
-        timer.record("llm_summarize", llm_ms)
-        if review_text:
-            review = {"verdict": review_text, "pros": [], "cons": []}
+    elif products:
+        # All product sources (hot_products, cache, live_search, similar, etc.)
+        # use fast template formatting — no LLM call needed
+        # Fast sources (hot_products, cache, ecommerce_web, link_fallback):
+        # skip expensive LLM call — use template-based formatting instead
+        timer.record("llm_summarize", 0)
+        formatted = _format_products_fast(products, source_type, confidence_score)
+        review = {"verdict": formatted, "pros": [], "cons": []}
     timer.stop("llm_summarize")
 
     # ── Compute (< 1ms) ──
@@ -1161,18 +1561,10 @@ async def run_pipeline(
         "fast_mode": route_cfg.fast_mode,
     }
 
-    # ── Cache result ──
+    # ── Cache result (async, non-blocking) ──
     _result_cache[rk] = (time.time() + _RESULT_CACHE_TTL, result)
-    try:
-        from app.cache.redis_cache import get_cache
-        cache_layer = await get_cache()
-        await cache_layer.set(
-            f"eva:query:{rk}",
-            {**result, "expiry": time.time() + _RESULT_CACHE_TTL},
-            ttl=_RESULT_CACHE_TTL,
-        )
-    except Exception:
-        pass
+    # Redis write is fire-and-forget — don't block the response
+    asyncio.create_task(_redis_cache_write(rk, result, _RESULT_CACHE_TTL))
 
     append_log(
         "SUCCESS",

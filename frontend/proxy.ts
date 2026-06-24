@@ -11,7 +11,7 @@ export default function proxy(request: NextRequest) {
     pathname.startsWith("/_next") ||
     pathname.startsWith("/api") ||
     pathname.startsWith("/favicon") ||
-    pathname.match(/\.(svg|png|jpg|ico|css|js)$/)
+    pathname.match(/\.(svg|png|jpg|ico|css|js|mp4|webm|ogg|mov|woff2|ttf|woff)$/)
   ) {
     return NextResponse.next();
   }
@@ -34,5 +34,5 @@ export default function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!_next|api|favicon|.*\\.svg|.*\\.png|.*\\.jpg|.*\\.ico|.*\\.css|.*\\.js).*)"],
+  matcher: ["/((?!_next|api|favicon|.*\\.svg|.*\\.png|.*\\.jpg|.*\\.ico|.*\\.css|.*\\.js|.*\\.mp4|.*\\.webm|.*\\.ogg|.*\\.mov|.*\\.woff2|.*\\.ttf|.*\\.woff).*)"],
 };

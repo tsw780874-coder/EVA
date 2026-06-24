@@ -130,12 +130,23 @@ async def get_mcp_status(
     db: AsyncSession = Depends(get_db),
     _admin: User = Depends(require_admin),
 ):
-    # 从 agent_run 表统计各 Agent 的实际运行状态
+    # Try live MCP server stats first
+    try:
+        from mcp_server.server import get_mcp_stats
+        return get_mcp_stats()
+    except (ImportError, Exception):
+        pass
+
+    # Fallback to agent_runs indirect monitoring
     agent_types = {
         "search_products": "搜索商品",
         "compare_price": "价格对比",
         "analyze_reviews": "评论分析",
         "generate_report": "报告生成",
+        "save_memory": "保存记忆",
+        "query_memory": "查询记忆",
+        "web_search": "网页搜索",
+        "rag_search": "RAG搜索",
     }
 
     connectors = []

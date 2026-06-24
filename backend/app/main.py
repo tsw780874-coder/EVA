@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -47,7 +48,29 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     await seed_default_users()
+
+    # ── Milvus warmup + auto-seed (non-blocking, best-effort) ──
+    asyncio.create_task(_warmup_and_seed())
+
     yield
+
+
+async def _warmup_and_seed():
+    """Warm up Milvus connection and seed knowledge base if empty.
+
+    Fire-and-forget — failures do not block server startup.
+    """
+    try:
+        from app.agent.pipeline import warmup_milvus
+        await warmup_milvus()
+    except Exception:
+        pass
+
+    try:
+        from app.services.milvus_seed import auto_seed_on_startup
+        await auto_seed_on_startup()
+    except Exception:
+        pass
 
 
 app = FastAPI(

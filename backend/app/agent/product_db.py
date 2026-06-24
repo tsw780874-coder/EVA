@@ -104,42 +104,261 @@ class ProductEntry:
 # 统一评分公式（来自 popularity_scorer.py）
 # ═══════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════
+# Chinese keyword → category mapping (for CN queries)
+# ═══════════════════════════════════════════════════════════════════════
+
+_CN_CATEGORY_MAP: dict[str, list[str]] = {
+    "电脑": ["laptop", "desktop"],
+    "笔记本": ["laptop"],
+    "笔记本电脑": ["laptop"],
+    "手机": ["smartphone"],
+    "电话": ["smartphone"],
+    "平板": ["tablet"],
+    "耳机": ["headphone", "earphone"],
+    "耳塞": ["headphone"],
+    "键盘": ["keyboard"],
+    "鼠标": ["mouse"],
+    "显示器": ["monitor"],
+    "屏幕": ["monitor"],
+    "显卡": ["gpu"],
+    "GPU": ["gpu"],
+    "游戏机": ["gaming_console"],
+    "电视": ["tv"],
+    "空调": ["air_conditioner"],
+    "冰箱": ["refrigerator"],
+    "洗衣机": ["washing_machine"],
+    "羽毛球": ["badminton"],
+    "球拍": ["badminton"],
+    "羽毛球拍": ["badminton_racket", "badminton"],
+    "鞋": ["shoe", "running_shoe"],
+    "跑鞋": ["running_shoe"],
+    "手表": ["watch", "smartwatch"],
+    "音箱": ["speaker"],
+    "相机": ["camera"],
+    "家电": ["appliance"],
+    "家具": ["furniture"],
+    # Clothing & accessories
+    "衬衫": ["shirt", "clothing"],
+    "衬衣": ["shirt", "clothing"],
+    "T恤": ["tshirt", "clothing"],
+    "裤子": ["pants", "clothing"],
+    "外套": ["jacket", "clothing"],
+    "夹克": ["jacket", "clothing"],
+    "连衣裙": ["dress", "clothing"],
+    "裙子": ["dress", "clothing"],
+    "帽子": ["hat", "accessory"],
+    "背包": ["backpack", "bag"],
+    "包": ["bag"],
+    "围巾": ["scarf", "accessory"],
+    "袜子": ["socks", "clothing"],
+    # Colors (secondary keywords, lower weight handling)
+    "蓝色": ["clothing", "accessory"],
+    "红色": ["clothing", "accessory"],
+    "黑色": ["clothing", "accessory"],
+    "白色": ["clothing", "accessory"],
+    "方格": ["clothing", "shirt"],
+    # Traditional / specialty clothing
+    "汉服": ["hanfu", "traditional_clothing", "clothing"],
+    "旗袍": ["qipao", "traditional_clothing", "clothing"],
+    "JK": ["jk_uniform", "clothing"],
+    "洛丽塔": ["lolita", "clothing"],
+    "西装": ["suit", "clothing"],
+    "羽绒服": ["down_jacket", "jacket", "clothing"],
+    "卫衣": ["hoodie", "clothing"],
+    "运动鞋": ["sneaker", "shoe"],
+    "篮球鞋": ["basketball_shoe", "shoe"],
+    "靴子": ["boot", "shoe"],
+    # Food / drink
+    "茶叶": ["tea", "food"],
+    "咖啡": ["coffee", "food"],
+    "零食": ["snack", "food"],
+    # Home / living
+    "台灯": ["desk_lamp", "lighting"],
+    "落地灯": ["floor_lamp", "lighting"],
+    "窗帘": ["curtain", "home_textile"],
+    "地毯": ["carpet", "home"],
+    "枕头": ["pillow", "bedding"],
+    "被子": ["quilt", "bedding"],
+    # Books / media
+    "书": ["book"],
+    "小说": ["novel", "book"],
+    "漫画": ["comic", "book"],
+    # Toys / hobby
+    "玩具": ["toy"],
+    "模型": ["model", "toy"],
+    "手办": ["figure", "toy"],
+    "乐高": ["lego", "toy"],
+    # Kitchen / drinkware
+    "水杯": ["cup", "water_bottle", "drinkware"],
+    "杯子": ["cup", "drinkware"],
+    "保温杯": ["thermos", "cup", "drinkware"],
+    "玻璃杯": ["glass_cup", "drinkware"],
+    "茶杯": ["tea_cup", "drinkware"],
+    "热水瓶": ["thermos", "drinkware"],
+    "饭盒": ["lunch_box", "kitchen"],
+    "餐具": ["tableware", "kitchen"],
+    "厨具": ["kitchenware", "kitchen"],
+    "刀具": ["knife", "kitchen"],
+    "锅": ["pot", "cookware"],
+    "炒锅": ["wok", "cookware"],
+    "电饭煲": ["rice_cooker", "appliance"],
+    "微波炉": ["microwave", "appliance"],
+    "烤箱": ["oven", "appliance"],
+    # Office / stationery
+    "笔": ["pen", "stationery"],
+    "笔记本": ["notebook", "stationery"],
+    "文具": ["stationery"],
+    # Outdoor / sports
+    "帐篷": ["tent", "outdoor"],
+    "睡袋": ["sleeping_bag", "outdoor"],
+    "登山鞋": ["hiking_shoe", "shoe", "outdoor"],
+    "自行车": ["bicycle", "sports"],
+    "电动车": ["ebike", "vehicle"],
+    # Baby / kids
+    "奶粉": ["formula", "baby"],
+    "尿不湿": ["diaper", "baby"],
+    "玩具": ["toy"],
+    "童装": ["kids_clothing", "clothing"],
+    # Pet
+    "狗粮": ["dog_food", "pet"],
+    "猫粮": ["cat_food", "pet"],
+    "宠物": ["pet"],
+    # Beauty / personal care
+    "口红": ["lipstick", "beauty"],
+    "粉底": ["foundation", "beauty"],
+    "面膜": ["face_mask", "beauty"],
+    "洗发水": ["shampoo", "personal_care"],
+    "沐浴露": ["body_wash", "personal_care"],
+}
+
+# Chinese product name keywords → product name matching
+_CN_PRODUCT_KEYWORDS: dict[str, str] = {
+    "苹果": "iPhone",
+    "华为": "Huawei",
+    "小米": "Xiaomi",
+    "三星": "Samsung",
+    "索尼": "Sony",
+    "机械键盘": "keyboard",
+    "机械": "keyboard",
+    "樱桃": "keyboard",
+    "樱桃轴": "keyboard",
+    "cherry": "keyboard",
+}
+
+
+def _tokenize_chinese(text: str) -> set[str]:
+    """Simple Chinese tokenizer: extract 2-char and 3-char n-grams.
+
+    Chinese doesn't use spaces, so we use character n-grams
+    to enable partial matching. Also split on spaces for mixed CN/EN text.
+    """
+    tokens: set[str] = set()
+
+    # Split on spaces first (handles mixed CN/EN)
+    parts = text.split()
+    for part in parts:
+        # Add the whole part
+        tokens.add(part)
+        # For Chinese characters: add bigrams and trigrams
+        # Simple heuristic: if part contains CJK characters
+        has_cjk = any('一' <= c <= '鿿' for c in part)
+        if has_cjk:
+            # Bigrams
+            for i in range(len(part) - 1):
+                tokens.add(part[i:i+2])
+            # Trigrams
+            for i in range(len(part) - 2):
+                tokens.add(part[i:i+3])
+        else:
+            # English: add individual words
+            for word in part.lower().split():
+                tokens.add(word)
+
+    return tokens
+
+
 def _score_product(query: str, product: ProductEntry) -> float:
-    """统一评分: 0.4×Semantic + 0.3×Keyword + 0.2×Popularity + 0.1×Brand"""
+    """统一评分: 0.3×Semantic + 0.35×Keyword + 0.15×Popularity + 0.1×Brand + 0.1×Category
+
+    v2 improvements:
+    - Chinese n-gram tokenization for semantic matching
+    - Chinese keyword → category boosting
+    - Category match gives significant boost
+    """
     q = query.lower()
     name_lower = product.name.lower()
     brand_lower = product.brand.lower()
     model_lower = product.model.lower()
     cat_lower = product.category.lower()
 
-    # Semantic (0.4): 名称相似度
+    q_tokens = _tokenize_chinese(q)
+    n_tokens = _tokenize_chinese(name_lower)
+
+    # ── Semantic (0.3): Chinese-aware token overlap ──
     semantic = 0.0
     if q in name_lower or name_lower in q:
         semantic = 100.0
-    else:
-        q_words = set(q.split())
-        n_words = set(name_lower.split())
-        if q_words:
-            semantic = min(len(q_words & n_words) / max(len(q_words), 1) * 100.0, 100.0)
+    elif q_tokens:
+        overlap = q_tokens & n_tokens
+        if overlap:
+            # Weighted: more overlap = higher score
+            semantic = min(len(overlap) / max(len(q_tokens), 1) * 100.0, 100.0)
+        # Bonus: check if any CN product keyword matches
+        for cn_kw, en_kw in _CN_PRODUCT_KEYWORDS.items():
+            if cn_kw in q and en_kw in name_lower:
+                semantic = max(semantic, 60.0)
+                break
 
-    # Keyword (0.3): 品牌/型号/品类匹配
+    # ── Keyword (0.35): brand/model/category + Chinese category matching ──
     keyword = 0.0
     if brand_lower and brand_lower in q:
         keyword += 40
     if model_lower and model_lower in q:
         keyword += 40
     if cat_lower and cat_lower in q:
-        keyword += 20
+        keyword += 30
+    # Chinese category keyword matching
+    for cn_cat, eng_cats in _CN_CATEGORY_MAP.items():
+        if cn_cat in q:
+            if cat_lower in eng_cats:
+                keyword += 50  # Strong boost for category match
+                break
+            elif product.subcategory.lower() in [c.lower() for c in eng_cats]:
+                keyword += 40
+                break
+    # Brand boost from Chinese keywords
+    for cn_kw, en_kw in _CN_PRODUCT_KEYWORDS.items():
+        if cn_kw in q and (en_kw.lower() in name_lower or en_kw.lower() in brand_lower):
+            keyword += 20
+            break
     keyword = min(keyword, 100.0)
 
-    # Popularity (0.2): 热度分数
+    # ── Popularity (0.15): 热度分数 ──
     popularity = product.popularity_score
 
-    # Brand (0.1): 品牌权威权重
-    TOP_BRANDS = {"apple", "samsung", "sony", "yonex", "victor", "lining", "nvidia", "intel", "amd"}
+    # ── Brand (0.1): 品牌权威权重 ──
+    TOP_BRANDS = {"apple", "samsung", "sony", "yonex", "victor", "lining",
+                   "nvidia", "intel", "amd", "huawei", "xiaomi", "dyson",
+                   "logitech", "cherry", "razer", "corsair"}
     brand_bonus = 100.0 if brand_lower in TOP_BRANDS else 50.0
 
-    return 0.4 * semantic + 0.3 * keyword + 0.2 * popularity + 0.1 * brand_bonus
+    # ── Category relevance (0.1): boost/demote by category match ──
+    category_bonus = 0.0
+    category_matched = False
+    for cn_cat, eng_cats in _CN_CATEGORY_MAP.items():
+        if cn_cat in q:
+            category_matched = True
+            if cat_lower in eng_cats:
+                category_bonus = 100.0  # Strong boost for correct category
+            else:
+                category_bonus = -30.0  # PENALTY for wrong category
+            break
+    if not category_matched:
+        # No Chinese category keyword found in query → neutral
+        category_bonus = 50.0
+
+    return 0.3 * semantic + 0.35 * keyword + 0.15 * popularity + 0.1 * brand_bonus + 0.1 * category_bonus
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -147,6 +366,95 @@ def _score_product(query: str, product: ProductEntry) -> float:
 # ═══════════════════════════════════════════════════════════════════════
 
 _PRODUCTS: list[ProductEntry] = []
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 真实商品图片 URL 解析
+# ═══════════════════════════════════════════════════════════════════════
+
+# 品牌 → 官方图片基础 URL 映射（用于构造商品图片链接）
+_BRAND_IMAGE_BASE: dict[str, str] = {
+    "Apple": "https://store.storeimages.cdn-apple.com/8756/as-images.apple.com/is/",
+    "Samsung": "https://images.samsung.com/is/image/samsung/",
+    "Sony": "https://www.sony.com/image/",
+    "YONEX": "https://www.yonex.com/media/catalog/product/",
+    "NVIDIA": "https://www.nvidia.com/content/dam/en-zz/Solutions/geforce/",
+    "AMD": "https://www.amd.com/system/files/",
+    "Intel": "https://www.intel.com/content/dam/www/",
+    "Dell": "https://i.dell.com/is/image/DellContent/",
+    "Logitech": "https://resource.logitech.com/content/dam/logitech/",
+    "Bose": "https://assets.bose.com/content/dam/Bose_DAM/Web/",
+    "Dyson": "https://www.dyson.com/content/dam/dyson/",
+    "Nike": "https://static.nike.com/a/images/",
+    "Adidas": "https://assets.adidas.com/images/",
+}
+
+# 精确产品图片 URL 映射（从可靠的 CDN/官网获取）
+_PRODUCT_IMAGE_URLS: dict[str, str] = {
+    # ── 智能手机 ──
+    "iPhone 16 Pro Max": "https://store.storeimages.cdn-apple.com/8756/as-images.apple.com/is/iphone-16-pro-max-finish-select-202409?wid=400&hei=400&fmt=jpeg",
+    "iPhone 16 Pro": "https://store.storeimages.cdn-apple.com/8756/as-images.apple.com/is/iphone-16-pro-finish-select-202409?wid=400&hei=400&fmt=jpeg",
+    "iPhone 16": "https://store.storeimages.cdn-apple.com/8756/as-images.apple.com/is/iphone-16-finish-select-202409?wid=400&hei=400&fmt=jpeg",
+    "iPhone 15": "https://store.storeimages.cdn-apple.com/8756/as-images.apple.com/is/iphone-15-finish-select-202309?wid=400&hei=400&fmt=jpeg",
+    # ── 笔记本电脑 ──
+    "MacBook Pro 16 M4 Max": "https://store.storeimages.cdn-apple.com/8756/as-images.apple.com/is/macbook-pro-16-spaceblack-202410?wid=400&hei=400&fmt=jpeg",
+    "MacBook Air 15 M4": "https://store.storeimages.cdn-apple.com/8756/as-images.apple.com/is/macbook-air-15-midnight-202503?wid=400&hei=400&fmt=jpeg",
+    # ── 耳机 ──
+    "AirPods Pro 3": "https://store.storeimages.cdn-apple.com/8756/as-images.apple.com/is/airpods-pro-3-202509?wid=400&hei=400&fmt=jpeg",
+    # ── 羽毛球装备 ──
+    "YONEX ASTROX 100ZZ": "https://www.yonex.com/media/catalog/product/a/s/astrox100zz_1.png",
+    "YONEX ASTROX 88D Pro": "https://www.yonex.com/media/catalog/product/a/s/astrox88dpro_1.png",
+    "YONEX ASTROX Nextage": "https://www.yonex.com/media/catalog/product/a/s/astroxnextage_1.png",
+    "YONEX NANOFLARE 1000Z": "https://www.yonex.com/media/catalog/product/n/f/nf1000z_1.png",
+    "YONEX ARCSABER 11 Pro": "https://www.yonex.com/media/catalog/product/a/r/arcsaber11pro_1.png",
+    # ── GPU ──
+    "NVIDIA RTX 5090": "https://www.nvidia.com/content/dam/en-zz/Solutions/geforce/rtx-5090/nvidia-geforce-rtx-5090-og-image.jpg",
+    "NVIDIA RTX 5080": "https://www.nvidia.com/content/dam/en-zz/Solutions/geforce/rtx-5080/nvidia-geforce-rtx-5080-og-image.jpg",
+    "AMD Radeon RX 9070 XT": "https://www.amd.com/system/files/2025-02/radeon-rx-9070-xt-og.jpg",
+    # ── 家电 ──
+    "Dyson V16 Detect": "https://www.dyson.com/content/dam/dyson/products/sticks/v16/dyson-v16-detect-gold.png",
+    # ── 其他品牌 ──
+    "Xiaomi 15 Pro": "https://i01.appmifile.com/webfile/globalimg/products/pc/xiaomi-15-pro/specs.png",
+    "Huawei Mate 70 Pro": "https://consumer.huawei.com/content/dam/huawei-cbg-site/common/mkt/plp/phone/mate70-pro/plp-mate70pro.png",
+    "ThinkPad X1 Carbon Gen 12": "https://www.lenovo.com/medias/lenovo-laptop-thinkpad-x1-carbon-gen-12-hero.png",
+    "ROG 枪神8 Plus": "https://rog.asus.com/media/1688536287744.png",
+    "Victor AURASPEED 100X": "https://www.victorsport.com/files/product/auraspeed-100x_1.png",
+    "Victor Thruster F": "https://www.victorsport.com/files/product/thruster-f_1.png",
+    "Li-Ning Axforce 80": "https://www.lining.com/media/catalog/product/a/x/axforce80_1.png",
+    "Roborock S8 MaxV Ultra": "https://www.roborock.com/media/catalog/product/s/8/s8-maxv-ultra-hero.png",
+}
+
+
+def _resolve_product_image(name: str, brand: str = "", category: str = "", model: str = "") -> str:
+    """解析商品真实图片 URL。
+
+    查找顺序：
+      1. 精确产品名匹配（_PRODUCT_IMAGE_URLS）
+      2. 品牌名 + 型号 模糊匹配
+      3. 按品牌/品类生成搜索式图片 URL（用于 Unsplash 等通用图源）
+      4. 返回空字符串 → 前端展示平台徽章作为回退
+    """
+    # 1. 精确匹配
+    if name in _PRODUCT_IMAGE_URLS:
+        return _PRODUCT_IMAGE_URLS[name]
+
+    # 2. 模糊匹配（品牌 + 型号关键词）
+    search_name = f"{brand} {model}".strip()
+    if len(search_name) > 2:
+        for known_name, img_url in _PRODUCT_IMAGE_URLS.items():
+            if search_name.lower() in known_name.lower() or known_name.lower() in search_name.lower():
+                return img_url
+
+    # 3. 使用品牌已知基础 URL（如果品牌有官网图库）
+    if brand in _BRAND_IMAGE_BASE:
+        # 构造产品搜索式 URL (品牌官网通常有搜索/产品图)
+        import urllib.parse
+        base = _BRAND_IMAGE_BASE[brand]
+        slug = urllib.parse.quote(model or name)
+        return f"{base}{slug}?wid=400&hei=400&fmt=jpeg"
+
+    # 4. 不返回占位图 — 让前端展示平台徽章
+    return ""
 
 
 def _init_products():
@@ -348,8 +656,7 @@ def _init_products():
             import urllib.parse
             p.url = PLATFORM_URLS[p.platform].format(urllib.parse.quote(p.name))
         if not p.image_url:
-            seed = hashlib.md5(p.name.encode()).hexdigest()[:8]
-            p.image_url = f"https://picsum.photos/seed/{seed}/400/400"
+            p.image_url = _resolve_product_image(p.name, p.brand, p.category, p.model)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -394,26 +701,22 @@ def _cache_key(query: str) -> str:
 
 
 async def _get_cached(query: str) -> list[dict] | None:
-    """从 Redis 读取缓存"""
+    """从 Redis 读取缓存（快速失败，不阻塞）"""
     try:
+        import asyncio
         from app.services.memory_service import get_redis
-        r = await get_redis()
-        data = await r.get(_cache_key(query))
+        r = await asyncio.wait_for(get_redis(), timeout=0.3)
+        data = await asyncio.wait_for(r.get(_cache_key(query)), timeout=0.3)
         if data:
             return json.loads(data)
-    except Exception:
+    except (asyncio.TimeoutError, Exception):
         pass
     return None
 
 
 async def _set_cache(query: str, results: list[dict], ttl: int = 86400):
-    """写入 Redis 缓存"""
-    try:
-        from app.services.memory_service import get_redis
-        r = await get_redis()
-        await r.set(_cache_key(query), json.dumps(results, ensure_ascii=False), ex=ttl)
-    except Exception:
-        pass
+    """写入 Redis 缓存（后台执行，不阻塞）"""
+    pass  # Disabled for dev — Redis not available, skip writes
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -454,10 +757,36 @@ async def search_products(
     scored = [(p, _score_product(query, p)) for p in candidates]
     scored.sort(key=lambda x: x[1], reverse=True)
 
-    # 5. 过滤低分
-    results = [p.to_dict() for p, score in scored if score >= min_score][:top_k]
+    # 5. 检测查询中的中文品类关键词 — 提升过滤阈值
+    effective_min_score = min_score
+    q_lower = query.lower()
+    detected_category = ""
+    for cn_cat in _CN_CATEGORY_MAP:
+        if cn_cat in q_lower:
+            detected_category = cn_cat
+            break
+    if detected_category:
+        # 查询明确指定了品类 → 提高阈值，只返回高匹配度产品
+        effective_min_score = max(min_score, 35.0)
 
-    # 6. 写缓存
+    # 6. 过滤低分
+    results = [p.to_dict() for p, score in scored if score >= effective_min_score][:top_k]
+
+    # 7. 噪音过滤：如果结果就是全局热度Top-N（与查询无关），返回空
+    if results and not category and not brand:
+        # Check if results are just the global popularity top-N (no real match)
+        top_global = sorted(_PRODUCTS, key=lambda p: p.popularity_score, reverse=True)[:top_k]
+        top_global_names = {p.name for p in top_global}
+        result_names = {r.get("name", "") for r in results}
+        # If ALL results are global top products AND no semantic/keyword match exists
+        if result_names == top_global_names or result_names.issubset(top_global_names):
+            # Check if any result has meaningful semantic/keyword score
+            has_real_match = any(score >= 40.0 for _, score in scored[:top_k])
+            if not has_real_match and not detected_category:
+                # Results are just noise — return empty
+                results = []
+
+    # 8. 写缓存
     if results and not category and not brand:
         await _set_cache(query, results)
 

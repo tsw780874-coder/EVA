@@ -69,14 +69,19 @@ _RECOMMEND_PATTERNS = [
 _PRICE_CHECK_PATTERNS = [
     (["多少钱", "价格", "报价", "最低价", "最便宜", "降价", "优惠",
       "折扣", "促销", "特价", "便宜", "划算", "跌了", "涨了",
-      "价格走势", "什么时候便宜", "最低多少"],
+      "价格走势", "什么时候便宜", "最低多少",
+      # English
+      "price", "cost", "cheap", "cheapest", "discount", "deal",
+      "how much", "budget", "under", "affordable"],
      IntentType.PRICE_CHECK, 0.88),
 ]
 
 _REVIEW_PATTERNS = [
     (["评价", "评测", "测评", "口碑", "怎么样", "好用吗", "值得吗",
       "质量", "耐用", "好不好", "使用体验", "优缺点", "开箱",
-      "review", "体验", "测评视频", "实测"],
+      "review", "体验", "测评视频", "实测",
+      # English
+      "rating", "best", "good", "quality", "worth"],
      IntentType.PRODUCT_REVIEW, 0.85),
 ]
 
@@ -84,7 +89,9 @@ _GUIDE_PATTERNS = [
     (["怎么选", "如何选", "怎么挑", "选购指南", "购买指南", "选购攻略",
       "新手入门", "小白怎么", "第一次买", "怎么判断", "注意事项",
       "选购建议", "怎么辨别", "避坑", "踩坑", "选购技巧",
-      "如何购买", "指南", "攻略", "怎么区分"],
+      "如何购买", "指南", "攻略", "怎么区分",
+      # English
+      "how to choose", "guide", "which one", "what to look for"],
      IntentType.SHOPPING_GUIDE, 0.87),
 ]
 
@@ -108,7 +115,11 @@ _BUY_PATTERNS = [
     (["买", "购买", "下单", "入手", "采购", "代购", "海淘", "网购",
       "我要", "想买", "要买", "帮我找", "搜索", "找一下",
       "帮我看看", "有没有", "在哪买", "哪里买", "去哪买",
-      "想入手", "搞一个", "来一个"],
+      "想入手", "搞一个", "来一个",
+      # English patterns
+      "buy", "purchase", "order", "shop", "i want", "i need",
+      "find me", "looking for", "search for", "where to buy",
+      "where can i", "i'd like", "get me"],
      IntentType.BUY_PRODUCT, 0.80),
 ]
 
@@ -132,6 +143,9 @@ _PRODUCT_INDICATORS = [
     "Switch", "Nintendo", "Sony", "Bose", "Sennheiser", "DJI", "Dyson",
     "手机", "笔记本", "平板", "耳机", "手表", "键盘", "鼠标", "显示器",
     "显卡", "CPU", "游戏机", "音箱", "电视", "相机",
+    # English product terms
+    "phone", "laptop", "tablet", "headphone", "earphone", "keyboard", "mouse",
+    "monitor", "gpu", "speaker", "camera", "watch", "console", "drone",
     # Sports
     "YONEX", "尤尼克斯", "Victor", "李宁", "Li-Ning", "川崎", "美津浓",
     "天斧", "疾光", "弓箭", "双刃", "龙牙", "雷霆", "神速", "羽毛球拍",

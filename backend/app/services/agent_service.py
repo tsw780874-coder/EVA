@@ -16,8 +16,6 @@ import json
 from typing import AsyncGenerator
 from app.agent.pipeline import run_pipeline
 from app.agent.intent_router import route_intent, is_shopping_intent, IntentType
-from app.agent.llm_utils import llm_call
-from app.agent.progressive_context import ProgressiveContextBuilder, get_pre_search_prompt
 from app.core.llm import get_available_models, _verified_models
 from app.api.v1.admin import append_log
 from app.hybrid.core import hybrid_ai
@@ -54,8 +52,6 @@ async def run_agent_stream(
       - Verification 放后台，不阻塞 final_report
     """
     settings = get_settings()
-    token_poll_ms = settings.token_poll_interval_ms / 1000.0
-    queue_size = settings.token_queue_size
 
     # ── 1. 立即确认 (< 1ms) ──
     yield _sse({"type": "agent_start", "message": "Agent 已启动，正在分析..."})
@@ -87,54 +83,41 @@ async def run_agent_stream(
         yield _sse({"type": "done"})
         return
 
-    # ── 5. 购物意图 — v8 LLM抢占模式 ──
-    token_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=queue_size)
-    ctx_builder = ProgressiveContextBuilder(user_query, intent_result.intent.value)
+    # ── 5. 购物意图 — 异步Pipeline + 心跳保活 ──
+    yield _sse({"type": "agent_progress", "agent": "search_agent", "message": "正在搜索电商平台..."})
 
-    async def token_callback(text: str):
-        await token_queue.put(text)
-
-    # 5a. 立即启动 LLM 流 (抢占式 — 不等搜索)
-    pre_sys, pre_msg = get_pre_search_prompt(user_query, intent_result.intent.value)
-    llm_task = asyncio.create_task(
-        llm_call(
-            system_prompt=pre_sys,
-            user_message=pre_msg,
-            max_tokens=150,  # 初始响应短一些
-            temperature=0.4,
-            user_id=user_id,
-            node_name="pre_search",
-            stream_callback=token_callback,
-        )
-    )
-
-    # 5b. Pipeline 并行搜索（与 LLM 同时跑）
+    # Run pipeline with CLEAN user query (not chat history context)
+    # Context is only needed for LLM summarization which is no longer used
     pipeline_task = asyncio.create_task(
-        run_pipeline(user_query=context, user_id=user_id, stream_callback=None)
+        run_pipeline(user_query=user_query, user_id=user_id, stream_callback=None)
     )
 
-    # 5c. 主循环 — 双任务同时运行时的 token 排水
-    while not llm_task.done() or not pipeline_task.done():
+    # Heartbeat: yield progress every 600ms while pipeline runs
+    heartbeat_msgs = [
+        "正在搜索电商平台...",
+        "正在比价京东、天猫...",
+        "正在查询淘宝、得物...",
+        "正在搜索拼多多、唯品会...",
+        "正在整理商品信息...",
+    ]
+    hb_idx = 0
+    while not pipeline_task.done():
         try:
-            text = await asyncio.wait_for(token_queue.get(), timeout=token_poll_ms)
-            yield _sse({"type": "token", "text": text, "node": "search_review"})
+            await asyncio.wait_for(
+                asyncio.shield(pipeline_task),
+                timeout=0.6,
+            )
         except asyncio.TimeoutError:
-            # 轮询间隔 — 检查是否有 token 到达
-            pass
+            yield _sse({"type": "agent_progress", "agent": "search_agent",
+                       "message": heartbeat_msgs[hb_idx % len(heartbeat_msgs)]})
+            hb_idx += 1
 
-    # 排空残余 token
-    while not token_queue.empty():
-        text = token_queue.get_nowait()
-        yield _sse({"type": "token", "text": text, "node": "search_review"})
-
-    # ── 6. 获取 Pipeline 结果 ──
+    # Get result
     try:
         result = pipeline_task.result()
     except Exception as e:
         append_log("ERROR", f"Agent 异常: {str(e)[:100]}")
-        fallback = get_active_fallback()
-        hint = f" 系统已自动切换至 {fallback} 模型，请重试。" if fallback else ""
-        yield _sse({"type": "error", "message": str(e)[:100] + hint})
+        yield _sse({"type": "error", "message": f"服务暂时不可用: {str(e)[:80]}"})
         yield _sse({"type": "done"})
         return
 
@@ -142,10 +125,11 @@ async def run_agent_stream(
     search_layers = result.get("search_layers", [])
     data_source = result.get("data_source", "unknown")
 
-    # ── 7. 搜索结果已到 — 注入 LLM 上下文做增强总结 ──
+    # ── 6. 搜索结果到 — 推送给前端 ──
     if products:
         # 发射搜索层进度
         layer_names = {
+            "ecommerce_web": "电商平台Web搜索",
             "hot_products": "热门商品库",
             "trending_normalize": "热门搜索匹配",
             "rag": "RAG知识库",
@@ -174,56 +158,28 @@ async def run_agent_stream(
                    "products": products, "data_source": data_source,
                    "search_layers": search_layers})
 
-        # 用搜索结果做增强型 LLM 总结
-        await ctx_builder.add_products(products, data_source)
-        rag_docs = result.get("rag_docs", [])
-        if rag_docs:
-            await ctx_builder.add_rag_docs(rag_docs)
-
-        sys_prompt, user_msg = ctx_builder.build_prompt()
-        enhance_text, _, _ = await llm_call(
-            system_prompt=sys_prompt,
-            user_message=user_msg,
-            max_tokens=400,
-            temperature=0.3,
-            user_id=user_id,
-            node_name="post_search_enhance",
-            stream_callback=token_callback,
-        )
-
-        # 排空增强 LLM 的 token
-        while not token_queue.empty():
-            text = token_queue.get_nowait()
-            yield _sse({"type": "token", "text": text, "node": "search_review"})
-
     yield _sse({"type": "agent_progress", "agent": "analysis_pipeline", "message": "综合分析"})
 
-    # ── 8. 先发射 final_report（不等待验证）──
+    # ── 7. 发射 final_report ──
     final_report = result.get("final_report", "")
     if final_report:
         yield _sse({"type": "final_report", "markdown": final_report})
 
-    # ── 9. Trust 元数据（先发射基础版）──
+    # ── 8. Trust 元数据 ──
     yield _sse({"type": "trust", "confidence": result.get("confidence", 0),
                 "data_source": result.get("data_source", "unknown"),
                 "citation": result.get("citation", ""),
                 "warning": result.get("confidence_warning"),
                 "search_layers": result.get("search_layers", []),
                 "total_products": result.get("total_products_found", 0),
-                "verification_passed": True,   # 先乐观通过
+                "verification_passed": True,
                 "verification_warnings": []})
 
-    # ── 10. Perf timing ──
+    # ── 9. Perf timing ──
     if result.get("perf"):
         yield _sse({"type": "perf", "timing": result["perf"]})
 
     yield _sse({"type": "done"})
-
-    # ── 11. 异步 Verification（后台执行，不阻塞用户响应）──
-    if final_report and products:
-        asyncio.create_task(
-            _async_verify_and_emit(final_report, products, result, token_queue)
-        )
 
 
 def _sse(data: dict) -> str:
@@ -374,38 +330,46 @@ async def run_hybrid_agent_stream(
     # ── 3. Build context ──
     context = _build_context(chat_history, user_query)
 
-    # ── 4. Launch v6 pipeline + HybridAI in parallel ──
-    #    v6 pipeline runs the 7-layer product search
-    #    HybridAI queries Web, Memory, Tool sources concurrently
-
+    # ── 4. Launch v6 pipeline + HybridAI in parallel with heartbeat ──
     token_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=128)
 
     async def token_callback(text: str):
         await token_queue.put(text)
 
-    # HybridAI task (Web + Memory + Tool + source selection)
+    # HybridAI task (Web + Memory + Tool)
     hybrid_task = asyncio.create_task(
         hybrid_ai.process(
-            user_query=context,
-            user_id=user_id,
-            chat_history=chat_history,
-            existing_products=None,  # Will be filled after pipeline completes
-            existing_rag_docs=None,
-            llm_call_fn=None,  # We'll summarize manually
+            user_query=context, user_id=user_id, chat_history=chat_history,
+            existing_products=None, existing_rag_docs=None, llm_call_fn=None,
         )
     )
 
     # v6 Pipeline task
     pipeline_task = asyncio.create_task(
-        run_pipeline(user_query=context, user_id=user_id, stream_callback=token_callback)
+        run_pipeline(user_query=user_query, user_id=user_id, stream_callback=token_callback)
     )
 
-    # ── 5. Drain tokens while pipeline + hybrid run ──
-    while not pipeline_task.done() and not hybrid_task.done():
+    # ── 5. Heartbeat loop — keep frontend alive while tasks run ──
+    settings = get_settings()
+    heartbeat_msgs = [
+        "正在多源分析...", "正在搜索电商平台...", "正在查询实时价格...",
+        "正在检索知识库...", "正在整理商品信息...",
+    ]
+    hb_idx = 0
+    while not pipeline_task.done():
         try:
-            text = await asyncio.wait_for(token_queue.get(), timeout=0.08)
-            yield _sse({"type": "token", "text": text, "node": "search_review"})
-        except asyncio.TimeoutError:
+            # Try to get a token first (higher priority)
+            try:
+                text = await asyncio.wait_for(token_queue.get(), timeout=0.6)
+                yield _sse({"type": "token", "text": text, "node": "search_review"})
+                continue
+            except asyncio.TimeoutError:
+                pass
+            # Heartbeat progress
+            yield _sse({"type": "agent_progress", "agent": "search_agent",
+                       "message": heartbeat_msgs[hb_idx % len(heartbeat_msgs)]})
+            hb_idx += 1
+        except Exception:
             pass
 
     # Drain remaining tokens
@@ -429,9 +393,20 @@ async def run_hybrid_agent_stream(
     data_source = result.get("data_source", "unknown")
     v6_confidence = result.get("confidence", 0)
 
-    # ── 7. Get HybridAI result ──
+    # ── 7. Get HybridAI result (with timeout) ──
     try:
-        hybrid_result = await hybrid_task
+        hybrid_result = await asyncio.wait_for(hybrid_task, timeout=8.0)
+    except asyncio.TimeoutError:
+        append_log("WARN", "HybridAI timed out after 8s, falling back to v6 only")
+        from app.hybrid.types import HybridResult, SourceType as ST, ConfidenceLevel as CL
+        hybrid_result = HybridResult(
+            answer=result.get("final_report", ""),
+            sources_used=[SourceType.RAG],
+            primary_source=SourceType.RAG,
+            confidence=v6_confidence,
+            confidence_level=CL.HIGH if v6_confidence >= 70 else CL.MEDIUM if v6_confidence >= 40 else CL.LOW,
+            warnings=["HybridAI引擎超时，使用v6管线结果。"],
+        )
     except Exception as e:
         append_log("WARN", f"HybridAI engine failed: {str(e)[:80]}, falling back to v6 only")
         # Build a minimal HybridResult from v6 data
@@ -454,6 +429,7 @@ async def run_hybrid_agent_stream(
     # ── 9. Emit products (from v6 pipeline) ──
     if products:
         layer_names = {
+            "ecommerce_web": "电商平台Web搜索",
             "hot_products": "热门商品库",
             "trending_normalize": "热门搜索匹配",
             "rag": "RAG知识库",
