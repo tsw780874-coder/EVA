@@ -150,10 +150,7 @@ EVA/
 │   │   ├── products/            # 商品数据 (Markdown+YAML)
 │   │   ├── ecommerce_rules/     # 平台政策
 │   │   └── faq/                 # 常见问答
-│   ├── mcp_server/              # MCP Server (8 工具)
-│   └── tests/                   # 测试套件
-│       ├── test_blackbox.py     # 黑盒测试 (API)
-│       └── test_whitebox.py     # 白盒测试 (模块)
+│   └──  mcp_server/              # MCP Server (8 工具)
 │
 ├── docker-compose.yml           # 9 服务编排
 ├── nginx.conf                   # Nginx 反向代理
