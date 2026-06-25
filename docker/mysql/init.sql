@@ -1,5 +1,0 @@
--- EVA Database Initialization
-CREATE DATABASE IF NOT EXISTS eva CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER IF NOT EXISTS 'eva'@'%' IDENTIFIED BY 'eva_prod_2024';
-GRANT ALL PRIVILEGES ON eva.* TO 'eva'@'%';
-FLUSH PRIVILEGES;
