@@ -146,7 +146,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   streamEvents: [],
   streamTokens: "",
   abortController: null,
-  useHybrid: false,  // Use fast /stream by default; hybrid is opt-in for power users
+  useHybrid: true,  // v7 hybrid by default, with graceful fallback
   hybrid: { ...EMPTY_HYBRID },  // v8 hybrid state
 
   loadSessions: async () => {

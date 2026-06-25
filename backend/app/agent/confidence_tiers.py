@@ -85,7 +85,6 @@ _SOURCE_TYPE_TIERS: dict[str, TierLevel] = {
     "live_search": TierLevel.C_THIRD_PARTY, # Real-time search
     "similar_search": TierLevel.C_THIRD_PARTY,
     "link_fallback": TierLevel.D_UGC,        # Generated links
-    "ecommerce_web": TierLevel.C_THIRD_PARTY,  # Search engine → real e-commerce links
     "simulated": TierLevel.E_UNKNOWN,        # Template/simulated data
     "llm_web_search": TierLevel.D_UGC,
 }

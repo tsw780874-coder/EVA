@@ -27,65 +27,6 @@ TOOLS: dict[str, callable] = {}
 TOOL_SCHEMAS: dict[str, dict] = {}
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# MCP 调用追踪 — 实时监控每个工具的调用次数、延迟、错误率
-# ═══════════════════════════════════════════════════════════════════════
-
-import time as _time
-from collections import defaultdict
-
-_mcp_call_stats: dict[str, dict] = defaultdict(lambda: {
-    "total_calls": 0,
-    "success_calls": 0,
-    "error_calls": 0,
-    "total_latency_ms": 0.0,
-    "last_call_at": "",
-    "last_error": "",
-})
-
-_MCP_START_TIME = _time.time()
-
-
-def _track_call(name: str, success: bool, latency_ms: float, error: str = ""):
-    """Record an MCP tool call for monitoring."""
-    stats = _mcp_call_stats[name]
-    stats["total_calls"] += 1
-    if success:
-        stats["success_calls"] += 1
-    else:
-        stats["error_calls"] += 1
-        stats["last_error"] = error[:200]
-    stats["total_latency_ms"] += latency_ms
-    stats["last_call_at"] = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
-
-
-def get_mcp_stats() -> dict:
-    """Return current MCP call statistics for monitoring."""
-    connectors = []
-    for name, schema in TOOL_SCHEMAS.items():
-        stats = _mcp_call_stats.get(name, {})
-        total = stats.get("total_calls", 0)
-        success = stats.get("success_calls", 0)
-        avg_latency = (stats.get("total_latency_ms", 0) / total * 1000) if total > 0 else 0
-        connectors.append({
-            "key": name,
-            "name": name,
-            "label": schema.get("description", name),
-            "status": "active" if total > 0 else "ready",
-            "total_calls": total,
-            "success_calls": success,
-            "error_calls": stats.get("error_calls", 0),
-            "avg_latency_us": round(avg_latency),
-            "last_call_at": stats.get("last_call_at", ""),
-            "last_error": stats.get("last_error", "") if stats.get("error_calls", 0) > 0 else "",
-        })
-    return {
-        "connectors": connectors,
-        "uptime_seconds": round(_time.time() - _MCP_START_TIME),
-        "total_tools": len(TOOLS),
-    }
-
-
 def register_tool(name: str, description: str = "", parameters: dict | None = None):
     """注册 MCP 工具"""
     def decorator(fn):
@@ -347,14 +288,7 @@ async def handle_stdio():
                     },
                 }
             elif method == "tools/call" and tool_name in TOOLS:
-                t0 = _time.perf_counter()
-                try:
-                    result = await TOOLS[tool_name](**tool_args)
-                    elapsed = (_time.perf_counter() - t0) * 1000
-                    _track_call(tool_name, True, elapsed)
-                except Exception as exc:
-                    _track_call(tool_name, False, 0, str(exc)[:200])
-                    result = {"status": "failed", "error": str(exc)}
+                result = await TOOLS[tool_name](**tool_args)
                 response = {
                     "jsonrpc": "2.0",
                     "id": request.get("id"),
@@ -367,28 +301,13 @@ async def handle_stdio():
                         ]
                     },
                 }
-            elif method == "tools/call" and tool_name not in TOOLS:
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": request.get("id"),
-                    "error": {
-                        "code": -32601,
-                        "message": f"Unknown tool: {tool_name}",
-                    },
-                }
-            elif method == "mcp/health":
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": request.get("id"),
-                    "result": get_mcp_stats(),
-                }
             else:
                 response = {
                     "jsonrpc": "2.0",
                     "id": request.get("id"),
                     "error": {
                         "code": -32601,
-                        "message": f"Unknown method: {method}",
+                        "message": f"Unknown method or tool: {tool_name}",
                     },
                 }
 
@@ -400,87 +319,7 @@ async def handle_stdio():
                 "id": request.get("id", 0) if 'request' in dir() else 0,
                 "error": {"code": -32603, "message": str(e)},
             }
-            # Track error on tool calls
-            if 'tool_name' in dir() and tool_name:
-                _track_call(tool_name, False, 0, str(e)[:200])
             print(json.dumps(error_response, ensure_ascii=False), flush=True)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# SSE Transport (生产环境 HTTP 长连接支持)
-# ═══════════════════════════════════════════════════════════════════════
-
-async def handle_sse(scope, receive, send):
-    """ASGI SSE transport for MCP tools over HTTP.
-
-    Accepts JSON-RPC requests via POST and streams responses as SSE.
-    Compatible with production HTTP servers (uvicorn, gunicorn).
-    """
-    if scope["type"] == "http" and scope["method"] == "POST":
-        # Read request body
-        body = b""
-        more_body = True
-        while more_body:
-            msg = await receive()
-            body += msg.get("body", b"")
-            more_body = msg.get("more_body", False)
-
-        try:
-            request = json.loads(body.decode())
-            method = request.get("method")
-            tool_name = request.get("params", {}).get("name", "unknown")
-            tool_args = request.get("params", {}).get("arguments", {})
-
-            if method == "tools/list":
-                result = {"tools": list(TOOL_SCHEMAS.values())}
-            elif method == "mcp/health":
-                result = get_mcp_stats()
-            elif method == "tools/call" and tool_name in TOOLS:
-                t0 = _time.perf_counter()
-                try:
-                    result = await TOOLS[tool_name](**tool_args)
-                    elapsed = (_time.perf_counter() - t0) * 1000
-                    _track_call(tool_name, True, elapsed)
-                    # Wrap in MCP content format
-                    result = {
-                        "content": [
-                            {"type": "text", "text": json.dumps(result, ensure_ascii=False)}
-                        ]
-                    }
-                except Exception as e:
-                    _track_call(tool_name, False, 0, str(e)[:200])
-                    result = {"error": str(e)}
-            else:
-                result = {"error": f"Unknown method: {method}"}
-
-            response = {"jsonrpc": "2.0", "id": request.get("id"), "result": result}
-        except json.JSONDecodeError:
-            response = {"jsonrpc": "2.0", "id": 0, "error": {"code": -32700, "message": "Parse error"}}
-
-        # Send SSE response
-        sse_data = f"data: {json.dumps(response, ensure_ascii=False)}\n\n"
-        await send({
-            "type": "http.response.start",
-            "status": 200,
-            "headers": [
-                (b"content-type", b"text/event-stream"),
-                (b"cache-control", b"no-cache"),
-                (b"access-control-allow-origin", b"*"),
-            ],
-        })
-        await send({"type": "http.response.body", "body": sse_data.encode()})
-
-    elif scope["method"] == "OPTIONS":
-        await send({
-            "type": "http.response.start",
-            "status": 200,
-            "headers": [
-                (b"access-control-allow-origin", b"*"),
-                (b"access-control-allow-methods", b"POST, OPTIONS"),
-                (b"access-control-allow-headers", b"content-type"),
-            ],
-        })
-        await send({"type": "http.response.body", "body": b""})
 
 
 if __name__ == "__main__":

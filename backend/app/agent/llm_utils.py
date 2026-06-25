@@ -16,9 +16,9 @@ from app.core.llm import get_llm_client, get_model_name, track_token_usage, trac
 from app.api.v1.admin import append_log
 
 # Default fallback when no router is used
-DEFAULT_PROVIDERS = ["groq", "glm_flash", "deepseek"]
-MAX_ATTEMPTS = 3
-_LLM_CALL_TIMEOUT = 1.8  # per-provider timeout (reduced from 2.5s)
+DEFAULT_PROVIDERS = ["groq", "glm_flash", "ernie35", "deepseek"]
+MAX_ATTEMPTS = 4
+_LLM_CALL_TIMEOUT = 2.5  # per-provider timeout
 
 # ── In-memory fallback cache (always available) ──
 _cache: dict[str, tuple[float, str, str]] = {}
@@ -27,23 +27,6 @@ _CACHE_TTL = 300
 
 def _cache_key(system_prompt: str, user_message: str) -> str:
     return hashlib.sha256(f"{system_prompt}|||{user_message}".encode()).hexdigest()
-
-
-async def _redis_cache_write(ck: str, content: str, provider: str, elapsed_ms: float) -> None:
-    """Fire-and-forget Redis cache write — never blocks the caller."""
-    try:
-        from app.cache.redis_cache import get_cache
-        cache_layer = await asyncio.wait_for(get_cache(), timeout=0.3)
-        await asyncio.wait_for(
-            cache_layer.set(
-                f"eva:llm:{ck}",
-                {"c": content, "p": provider, "t": elapsed_ms},
-                ttl=_CACHE_TTL,
-            ),
-            timeout=0.3,
-        )
-    except (asyncio.TimeoutError, Exception):
-        pass  # Redis unavailable — no problem, memory cache still works
 
 
 # ── Token estimation (fast, no API call) ──
@@ -193,8 +176,16 @@ async def llm_call(
 
             # ── Store in both caches ──
             _cache[ck] = (time.time() + _CACHE_TTL, content, provider)
-            # Fire-and-forget Redis write — don't block the response
-            asyncio.create_task(_redis_cache_write(ck, content, provider, elapsed_ms))
+            try:
+                from app.cache.redis_cache import get_cache
+                cache_layer = await get_cache()
+                await cache_layer.set(
+                    f"eva:llm:{ck}",
+                    {"c": content, "p": provider, "t": elapsed_ms},
+                    ttl=_CACHE_TTL,
+                )
+            except Exception:
+                pass
 
             return content, provider
         except (asyncio.TimeoutError, Exception):
@@ -202,43 +193,38 @@ async def llm_call(
 
     t_total = time.perf_counter()
 
-    # ── 4. Race providers (with overall timeout) ──
+    # ── 4. Race providers ──
     tasks = [asyncio.create_task(_try_provider(p)) for p in provider_list]
-    overall_timeout = timeout * 1.2  # Slightly more than per-provider timeout
 
     try:
-        done, pending = await asyncio.wait(
-            tasks, return_when=asyncio.FIRST_COMPLETED,
-            timeout=overall_timeout,
-        )
-        if done:
-            for t in done:
-                result = t.result()
-                if result is not None:
-                    for pt in pending:
-                        pt.cancel()
-                    content, provider = result
-                    elapsed_ms = (time.perf_counter() - t_total) * 1000
-                    append_log(
-                        "SUCCESS",
-                        f"{node_name} 完成 ({elapsed_ms:.0f}ms, est_tokens={est_tokens}) "
-                        f"provider={provider}",
-                    )
-                    return content, provider, elapsed_ms
-
-        # Second wave — try any remaining
-        pending = pending or tasks
-        done2, _ = await asyncio.wait(
-            pending, return_when=asyncio.FIRST_COMPLETED, timeout=1.5,
-        )
-        for t in done2:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in done:
             result = t.result()
             if result is not None:
                 for pt in pending:
                     pt.cancel()
                 content, provider = result
                 elapsed_ms = (time.perf_counter() - t_total) * 1000
+                append_log(
+                    "SUCCESS",
+                    f"{node_name} 完成 ({elapsed_ms:.0f}ms, est_tokens={est_tokens}) "
+                    f"provider={provider} route={'→'.join(provider_list[:3])}",
+                )
                 return content, provider, elapsed_ms
+
+        # Second wave
+        if pending:
+            done2, pending2 = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED, timeout=2.0,
+            )
+            for t in done2:
+                result = t.result()
+                if result is not None:
+                    for pt in pending2:
+                        pt.cancel()
+                    content, provider = result
+                    elapsed_ms = (time.perf_counter() - t_total) * 1000
+                    return content, provider, elapsed_ms
     finally:
         for t in tasks:
             if not t.done():

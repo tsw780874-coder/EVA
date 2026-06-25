@@ -71,14 +71,14 @@ class Settings(BaseSettings):
     # 7. 火山引擎 Seedream (图像生成)
     seedream_api_key: str = ""
 
-    # Web Search
-    serpapi_key: str = ""      # SerpAPI key for Google web search (e-commerce product links)
-    bing_api_key: str = ""     # Bing Web Search API key (free tier: 1000/mo, works in China)
-
     # 8. Groq (极速推理 LPU)
     groq_api_key: str = ""
     groq_model: str = "llama-3.1-8b-instant"
     groq_base_url: str = "https://api.groq.com/openai/v1"
+
+    # Web Search
+    serpapi_key: str = ""
+    bing_api_key: str = ""
 
     # ============ 默认 LLM 提供商 ============
     default_llm_provider: str = "deepseek"
@@ -102,7 +102,7 @@ class Settings(BaseSettings):
     pipeline_mode: str = "fast"
 
     # 超时配置 (毫秒)
-    pipeline_total_timeout_ms: int = 15000     # Pipeline 全局超时 (increased for web search)
+    pipeline_total_timeout_ms: int = 8000      # Pipeline 全局超时
     tool_execution_timeout_ms: int = 800       # 单工具执行超时
     llm_first_token_timeout_ms: int = 500      # LLM 首Token超时
     rag_search_timeout_ms: int = 500           # RAG搜索超时

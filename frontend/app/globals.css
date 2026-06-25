@@ -34,3 +34,41 @@ label, .label-text {
 
 /* 链接和按钮更明显的 hover */
 a:hover, button:hover { transition: all 0.2s ease; }
+
+/* 滚动指示器流光动画 */
+@keyframes scrollGlow {
+  from { transform: translateY(-100%); }
+  to   { transform: translateY(200%); }
+}
+.animate-scroll-glow {
+  animation: scrollGlow 2s ease-in-out infinite;
+}
+
+/* 移动端：强制隐藏视频，只显示静态图片 */
+@media (max-width: 767px) {
+  .hero-video-mobile-hidden {
+    display: none !important;
+  }
+  .hero-img-mobile-visible {
+    display: block !important;
+  }
+}
+
+/* 移动端菜单滑入动画 */
+@keyframes slideInRight {
+  from { transform: translateX(100%); }
+  to   { transform: translateX(0); }
+}
+.animate-slide-in-right {
+  animation: slideInRight 0.3s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* 视频无缝循环：硬件加速 + 消除循环跳帧闪烁 */
+.hero-video-seamless {
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+  perspective: 1000px;
+  -webkit-perspective: 1000px;
+  will-change: transform, opacity;
+  image-rendering: auto;
+}

@@ -22,9 +22,10 @@ interface AuthState {
 }
 
 export const useAuthStore = create<AuthState>((set, get) => ({
+  // SSR 安全：始终以 false 起始，由 init() 在客户端设置真实状态
   user: null,
   isLoading: true,
-  isAuthenticated: typeof window !== "undefined" && !!sessionStorage.getItem("access_token"),
+  isAuthenticated: false,
 
   init: () => {
     const hasToken = typeof window !== "undefined" && !!sessionStorage.getItem("access_token");
