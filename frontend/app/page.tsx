@@ -73,7 +73,7 @@ export default function FashionHome() {
       </div>
 
       {/* ── HERO ── */}
-      <section className="relative h-screen w-full overflow-hidden bg-black">
+      <section className="relative min-h-dvh w-full overflow-hidden bg-black">
 
         {/* 背景：PC 视频 / 移动端静态图 */}
         <div className="absolute inset-0 z-0 h-full w-full overflow-hidden pointer-events-none">
@@ -91,7 +91,7 @@ export default function FashionHome() {
             fetchPriority="high"
             loading="eager"
             decoding="sync"
-            className="hero-img-mobile-visible block md:hidden absolute inset-0 w-full h-full object-contain md:object-cover pointer-events-none select-none"
+            className="hero-img-mobile-visible block md:hidden absolute inset-0 w-full h-full object-cover pointer-events-none select-none"
           />
           <div className="absolute inset-0 bg-gradient-to-b from-white/10 via-transparent to-transparent pointer-events-none" />
           <div className="absolute inset-x-0 bottom-0 h-32 bg-gradient-to-t from-white via-white/40 to-transparent pointer-events-none" />

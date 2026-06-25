@@ -11,7 +11,7 @@ ENV NEXT_TELEMETRY_DISABLED=1
 ENV NEXT_PUBLIC_API_URL=
 ARG NODE_OPTIONS=--max-old-space-size=1024
 ENV NODE_OPTIONS=${NODE_OPTIONS}
-RUN node node_modules/.bin/next build
+RUN npx next build
 
 FROM node:22-alpine AS runner
 

@@ -24,6 +24,13 @@ export const metadata: Metadata = {
   description: "EVA 是您的智慧购物中枢，利用大模型深入分析每一个价格波动，为您锁定最优决策。",
 };
 
+export const viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
+  userScalable: false,
+};
+
 export default function RootLayout({
   children,
 }: Readonly<{

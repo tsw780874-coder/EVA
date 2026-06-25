@@ -1,6 +1,4 @@
-# EVA Docker Compose — 5 服务生产部署 (2C/2G)
-# Milvus 需 >4GB 内存，此配置跳过向量检索，使用 5 层搜索策略
-
+# EVA Docker Compose — 4 服务轻量部署 (2C/2G, SQLite)
 services:
   # ── Nginx 反向代理 ──
   nginx:
@@ -47,7 +45,7 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # ── FastAPI 后端 ──
+  # ── FastAPI 后端 (SQLite) ──
   backend:
     build:
       context: ./backend
@@ -58,18 +56,11 @@ services:
     env_file:
       - .env.production
     environment:
-      - USE_SQLITE=false
-      - DB_HOST=mysql
-      - DB_PORT=3306
-      - DB_USER=eva
-      - DB_PASSWORD=eva_prod_2024
-      - DB_NAME=eva
+      - USE_SQLITE=true
       - REDIS_URL=redis://redis:6379/0
       - CORS_ORIGINS=["http://tsw521.xyz","http://www.tsw521.xyz","http://39.96.65.233"]
       - PIPELINE_MODE=fast
     depends_on:
-      mysql:
-        condition: service_healthy
       redis:
         condition: service_healthy
     networks:
@@ -77,38 +68,6 @@ services:
     restart: unless-stopped
     mem_limit: 512m
     memswap_limit: 768m
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  # ── MySQL 8.4 ──
-  mysql:
-    image: mysql:8.4
-    container_name: eva-mysql
-    environment:
-      MYSQL_ROOT_PASSWORD: root_prod_2024
-      MYSQL_DATABASE: eva
-      MYSQL_USER: eva
-      MYSQL_PASSWORD: eva_prod_2024
-    expose:
-      - "3306"
-    volumes:
-      - mysql-data:/var/lib/mysql
-      - ./docker/mysql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
-      - ./docker/mysql/my.cnf:/etc/mysql/conf.d/my.cnf:ro
-    networks:
-      - eva-net
-    restart: unless-stopped
-    mem_limit: 400m
-    memswap_limit: 600m
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot_prod_2024"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
     logging:
       driver: "json-file"
       options:
@@ -141,8 +100,6 @@ services:
         max-file: "3"
 
 volumes:
-  mysql-data:
-    driver: local
   redis-data:
     driver: local
 
