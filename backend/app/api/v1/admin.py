@@ -179,6 +179,30 @@ async def get_mcp_status(
     }
 
 
+@router.get("/breakers")
+async def get_breakers(db: AsyncSession = Depends(get_db), _admin: User = Depends(require_admin)):
+    """获取所有 LLM provider 的熔断器状态。"""
+    try:
+        from app.core.circuit_breaker import get_breaker_states, reset_all_breakers
+        return {
+            "breakers": get_breaker_states(),
+            "total": len(get_breaker_states()),
+        }
+    except ImportError:
+        return {"breakers": {}, "total": 0}
+
+
+@router.post("/breakers/reset")
+async def reset_breakers(db: AsyncSession = Depends(get_db), _admin: User = Depends(require_admin)):
+    """重置所有熔断器"""
+    try:
+        from app.core.circuit_breaker import reset_all_breakers
+        reset_all_breakers()
+        return {"status": "reset"}
+    except ImportError:
+        return {"status": "unavailable"}
+
+
 # 内存日志缓冲区（最近 200 条）
 _log_buffer: list[dict] = []
 

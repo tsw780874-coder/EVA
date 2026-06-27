@@ -47,6 +47,7 @@ PLATFORM_URLS = {
 
 @lru_cache(maxsize=512)
 def _pick_image(name: str) -> str:
+    """Last-resort image placeholder. Only used when NO real image is available."""
     seed = hashlib.md5(name.encode()).hexdigest()[:8]
     return f"https://picsum.photos/seed/{seed}/400/400"
 
@@ -64,9 +65,16 @@ def _enrich_product(p: dict) -> dict:
         if tmpl:
             url = tmpl.format(quote(name))
 
+    # Image: use real image if available, never use placeholders for real data
     image_url = p.get("image_url", "") or p.get("imageUrl", "")
+    # Strip any placeholder images that may have leaked from upstream modules
+    if image_url and "picsum.photos" in image_url:
+        if p.get("source") not in ("simulated", "template"):
+            image_url = ""  # Remove placeholder — real data must not show fake images
     if not image_url:
-        image_url = _pick_image(name)
+        # Only use placeholder for simulated/template data
+        if p.get("source") in ("simulated", "template"):
+            image_url = _pick_image(name)
 
     p["id"] = pid
     p["url"] = url
@@ -78,6 +86,13 @@ def _enrich_product(p: dict) -> dict:
                 p[field] = float(p[field])
             except (ValueError, TypeError):
                 pass
+
+    # Preserve review_count if present
+    if "review_count" in p and p["review_count"] is not None:
+        try:
+            p["review_count"] = int(p["review_count"])
+        except (ValueError, TypeError):
+            pass
 
     # Ensure source field exists
     if "source" not in p:
@@ -141,11 +156,9 @@ def classify_intent(query: str) -> str:
 # Anti-hallucination prompts (v6 — progressive search, never fabricate)
 # ---------------------------------------------------------------------------
 
-_QUICK_CHAT_PROMPT = (
-    "你是一个友好的AI购物助手。如果问题涉及具体商品信息（价格、参数、评价），"
-    "请基于提供的上下文回答，不要凭记忆编造数据。"
-    "用中文简洁回复，2-3句话。"
-)
+# Gateway prompt v3.0 — imported from eva_system_prompt module
+# Replaces the old _QUICK_CHAT_PROMPT; enforces e-commerce semantic gateway rules
+from app.agent.eva_system_prompt import get_gateway_prompt, REFUSAL_MESSAGE, is_strictly_non_ecommerce
 
 # RAG-context prompt: LLM only SUMMARIZES, never generates product data
 _RAG_SUMMARIZE_PROMPT = (
@@ -222,8 +235,8 @@ async def rag_search_products(
             for doc in q_docs:
                 if doc not in docs:
                     docs.append(doc)
-        except Exception:
-            pass
+        except Exception as e:
+            append_log("WARN", f"RAG hybrid_search failed for '{q[:40]}': {type(e).__name__}")
 
         if docs:
             break  # Got results, stop trying variants
@@ -319,6 +332,7 @@ async def rag_summarize(
     user_id: str = "",
     stream_callback: Callable[[str], Awaitable[None]] | None = None,
     source_type: str = "rag",  # "rag" | "cache" | "live" | "similar" | "template" | "none"
+    chat_history: list[dict] | None = None,  # v10: 多轮对话历史
 ) -> tuple[str, str, float]:
     """Ask LLM to summarize search results. Never fabricates data.
 
@@ -342,9 +356,21 @@ async def rag_summarize(
                 platform = doc.get("platform", "未知")
                 url = doc.get("url", "")
                 conf = doc.get("confidence", "")
-                context_parts.append(
-                    f"[商品{i}] {name} | {platform} | ¥{price} | 置信度:{conf}%"
-                )
+                rating = doc.get("rating", "")
+                review_count = doc.get("review_count", "")
+                # Build rich product context line with ratings and reviews
+                parts = [f"[商品{i}] {name}"]
+                if platform:
+                    parts.append(f"平台:{platform}")
+                if price:
+                    parts.append(f"¥{price}")
+                if rating:
+                    parts.append(f"评分:{rating}/5")
+                if review_count:
+                    parts.append(f"{review_count}条评价")
+                if conf:
+                    parts.append(f"置信度:{conf}%")
+                context_parts.append(" | ".join(parts))
             else:
                 # RAG doc format
                 content = doc.get("content", "")[:500]
@@ -366,15 +392,31 @@ async def rag_summarize(
         prompt = _RAG_SUMMARIZE_PROMPT
 
     profile = route_query(query, intent)
-    content, provider, elapsed = await llm_call(
-        system_prompt=prompt,
-        user_message=f"用户查询: {query}\n\n检索结果:\n{context}",
-        max_tokens=profile.max_tokens,
-        temperature=0.3,
-        user_id=user_id,
-        node_name="rag_summarize",
-        stream_callback=stream_callback,
-    )
+    user_msg = f"用户查询: {query}\n\n检索结果:\n{context}"
+
+    # v10: 如果有历史对话，构建完整 messages 数组
+    if chat_history:
+        llm_messages = _build_llm_messages(prompt, user_msg, chat_history)
+        content, provider, elapsed = await llm_call(
+            system_prompt=prompt,
+            user_message=user_msg,
+            messages=llm_messages,
+            max_tokens=profile.max_tokens,
+            temperature=0.3,
+            user_id=user_id,
+            node_name="rag_summarize",
+            stream_callback=stream_callback,
+        )
+    else:
+        content, provider, elapsed = await llm_call(
+            system_prompt=prompt,
+            user_message=user_msg,
+            max_tokens=profile.max_tokens,
+            temperature=0.3,
+            user_id=user_id,
+            node_name="rag_summarize",
+            stream_callback=stream_callback,
+        )
     return content, provider, elapsed
 
 
@@ -438,6 +480,7 @@ def generate_report(
     citation_block: str = "",
     confidence_score: float = 0,
     confidence_warning: str | None = None,
+    shopping_decision: dict | None = None,
 ) -> str:
     lines = [f"## {user_query}", ""]
 
@@ -474,6 +517,36 @@ def generate_report(
 
     lines.append("")
 
+    # ── v4.0 Shopping Decision Report ──
+    if shopping_decision:
+        lines.append("## 🛍️ 购物决策报告")
+        lines.append("")
+        rec = shopping_decision.get("recommendation", "")
+        conf = shopping_decision.get("confidence_level", "")
+        emoji = {"推荐": "✅", "可买": "🟡", "不推荐": "❌"}.get(rec, "ℹ️")
+        lines.append(f"**{emoji} 推荐结论：{rec}**（可信度：{conf}）")
+        lines.append("")
+        reasons = shopping_decision.get("reasons", [])
+        if reasons:
+            lines.append("**✔ 推荐理由：**")
+            for r in reasons:
+                lines.append(f"- {r}")
+            lines.append("")
+        risks = shopping_decision.get("risks", [])
+        if risks:
+            lines.append("**⚠️ 风险提示：**")
+            for r in risks:
+                lines.append(f"- {r}")
+            lines.append("")
+        purchase = shopping_decision.get("purchase_advice", "")
+        if purchase:
+            lines.append(f"**💡 购买建议：**{purchase}")
+            lines.append("")
+        promo = shopping_decision.get("promo_advice", "")
+        if promo:
+            lines.append(f"**🎫 促销提醒：**{promo}")
+            lines.append("")
+
     # Show which products used simulated data
     simulated = [p for p in products if p.get("source") == "simulated"]
     if simulated:
@@ -507,6 +580,29 @@ def _result_cache_key(query: str) -> str:
     return hashlib.sha256(query.encode()).hexdigest()
 
 
+def _build_llm_messages(
+    system_prompt: str,
+    user_query: str,
+    chat_history: list[dict] | None = None,
+) -> list[dict]:
+    """v10: Build full messages array with optional multi-turn history.
+
+    Returns [{"role": "system", "content": system_prompt},
+             ...history messages...,
+             {"role": "user", "content": user_query}]
+    """
+    messages = [{"role": "system", "content": system_prompt}]
+    if chat_history:
+        # 只取 role + content 字段，过滤空内容
+        for m in chat_history:
+            role = m.get("role", "user") if isinstance(m, dict) else "user"
+            content = m.get("content", "") if isinstance(m, dict) else str(m)
+            if content.strip():
+                messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": user_query})
+    return messages
+
+
 # ---------------------------------------------------------------------------
 # Main Pipeline Entry Point (v6 — 5-Layer Search Strategy)
 # ---------------------------------------------------------------------------
@@ -526,6 +622,8 @@ async def run_pipeline(
     user_id: str = "",
     stream_callback: Callable[[str], Awaitable[None]] | None = None,
     bypass_cache: bool = False,
+    chat_history: list[dict] | None = None,  # v10: 多轮对话历史 [{role, content}...]
+    chat_context: str = "",  # DEPRECATED: 保留向后兼容，优先使用 chat_history
 ) -> dict:
     """v6 Multi-layer shopping pipeline. Returns at least 1 product whenever possible.
 
@@ -538,6 +636,21 @@ async def run_pipeline(
     """
     timer = get_timer()
     timer.start("pipeline")
+
+    # ── v6.0 Query Isolation ──
+    run_id = str(uuid.uuid4())[:8]
+
+    # ── v2.0 Semantic Cache Check — <10ms 命中直接返回 ──
+    timer.start("cache_check")
+    from app.agent.semantic_cache import semantic_cache
+    cached_result = await semantic_cache.get(user_query)
+    timer.stop("cache_check")
+    if cached_result is not None:
+        append_log("SUCCESS", f"SemanticCache HIT: {user_query[:40]} ({timer.elapsed_ms('cache_check'):.0f}ms)")
+        if stream_callback:
+            await stream_callback(cached_result.get("final_report", ""))
+        cached_result["perf"] = {"cache_hit_ms": timer.elapsed_ms("cache_check")}
+        return cached_result
     tracker = CitationTracker()
     search_layers_used: list[str] = []
 
@@ -554,8 +667,8 @@ async def run_pipeline(
                     await stream_callback(cached.get("final_report", ""))
                 cached["perf"] = {"cache_hit_ms": timer.elapsed_ms("pipeline")}
                 return cached
-        except Exception:
-            pass
+        except Exception as e:
+            append_log("DEBUG", f"Redis cache read failed: {type(e).__name__}")
 
     if not bypass_cache and rk in _result_cache:
         expiry, cached = _result_cache[rk]
@@ -568,7 +681,7 @@ async def run_pipeline(
 
     # ── Intent Routing (V2.0: 8-type classifier) (< 1ms) ──
     timer.start("intent")
-    from app.agent.intent_router import route_intent, get_route_config, is_shopping_intent
+    from app.agent.intent_router import route_intent, get_route_config, is_shopping_intent, IntentType
     intent_result = route_intent(user_query)
     intent = intent_result.intent.value  # Keep backwards compat string
     route_cfg = get_route_config(intent_result)
@@ -594,44 +707,68 @@ async def run_pipeline(
     confidence_warning: str | None = None
     verifier = DataVerifier()
     source_type = "none"  # Will be updated as we find data
+    shopping_decision = None  # v4.0 Real Commerce Engine decision
 
     if entity_category_ok:
         append_log("INFO", f"Entity detected: brand={entity.brand} product={entity.product} "
                   f"category={entity.category} confidence={entity.confidence:.0%}")
 
-    # ── Non-shopping intents: light LLM chat with intent-specific prompt ──
+    # ── v5.0 Category Lock — 类目约束（防止跨类目污染）──
+    from app.agent.category_mapper import map_category, filter_by_category
+    category_constraint = map_category(user_query)
+    if category_constraint.is_valid:
+        append_log("INFO", f"Category Lock: {category_constraint.primary}/{category_constraint.subcategory} "
+                  f"(conf={category_constraint.confidence:.0%})")
+
+    # ── Non-shopping intents: gateway-guided LLM chat ──
     if not is_shopping_intent(intent_result):
         from app.agent.intent_router import get_intent_prompt
         intent_prompt = get_intent_prompt(intent_result.intent)
 
-        # For trending/recommend that may benefit from product context
-        if intent_result.intent.value in ("trend_analysis", "recommend_products", "shopping_guide"):
-            # Try quick hot product lookup for context
-            try:
-                from app.agent.product_db import get_trending_products
-                hot = get_trending_products(top_k=5)
-                if hot:
-                    context = "热门商品参考：\n" + "\n".join(
-                        f"- {h['title']} ({h['brand']}, ¥{h['price_min']}-{h['price_max']})"
-                        for h in hot[:5]
-                    )
-                    user_query = f"{user_query}\n\n{context}"
-            except Exception:
-                pass
+        # ── Strictly non-ecommerce? Return refusal immediately (no LLM call → fast!) ──
+        if intent_result.intent == IntentType.GENERAL_CHAT and is_strictly_non_ecommerce(user_query):
+            append_log("INFO", f"Non-ecommerce query refused via gateway: {user_query[:50]}")
+            review = {"verdict": REFUSAL_MESSAGE, "pros": [], "cons": []}
+            tracker.add("非电商请求已拒绝", source_type="gateway", source_name="EVA语义网关")
+            confidence_score = 100.0
+            source_type = "gateway_refusal"
+            # Stream the refusal message if callback available
+            if stream_callback:
+                await stream_callback(REFUSAL_MESSAGE)
+        else:
+            # ── Potentially e-commerce — use gateway prompt merged with intent prompt ──
+            gateway_prompt = get_gateway_prompt(intent_result.intent.value)
 
-        review_text, _, llm_ms = await llm_call(
-            system_prompt=intent_prompt,
-            user_message=user_query,
-            max_tokens=route_cfg.llm_max_tokens,
-            temperature=route_cfg.llm_temperature,
-            user_id=user_id,
-            node_name=f"intent_{intent_result.intent.value}",
-            stream_callback=stream_callback,
-        )
-        timer.record("llm_chat", llm_ms)
-        review = {"verdict": review_text, "pros": [], "cons": []}
-        tracker.add(f"AI回复（{intent_result.intent.value}）", source_type="unknown", source_name="LLM")
-        confidence_score = 100.0
+            # For trending/recommend that may benefit from product context
+            if intent_result.intent.value in ("trend_analysis", "recommend_products", "shopping_guide"):
+                try:
+                    from app.agent.product_db import get_trending_products
+                    hot = get_trending_products(top_k=5)
+                    if hot:
+                        context = "热门商品参考：\n" + "\n".join(
+                            f"- {h['title']} ({h['brand']}, ¥{h['price_min']}-{h['price_max']})"
+                            for h in hot[:5]
+                        )
+                        user_query = f"{user_query}\n\n{context}"
+                except Exception as e:
+                    append_log("DEBUG", f"Trending products lookup skipped: {type(e).__name__}")
+
+            # v10: LLM 使用完整 messages 数组（含多轮历史），搜索已用纯净 query
+            llm_messages = _build_llm_messages(gateway_prompt, user_query, chat_history)
+            review_text, _, llm_ms = await llm_call(
+                system_prompt=gateway_prompt,  # kept for cache key compat
+                user_message=user_query,        # kept for cache key compat
+                messages=llm_messages,          # v10: full multi-turn context
+                max_tokens=route_cfg.llm_max_tokens,
+                temperature=route_cfg.llm_temperature,
+                user_id=user_id,
+                node_name=f"intent_{intent_result.intent.value}",
+                stream_callback=stream_callback,
+            )
+            timer.record("llm_chat", llm_ms)
+            review = {"verdict": review_text, "pros": [], "cons": []}
+            tracker.add(f"AI回复（{intent_result.intent.value}）", source_type="unknown", source_name="LLM")
+            confidence_score = 100.0
         source_type = "llm"
 
     else:
@@ -701,18 +838,54 @@ async def run_pipeline(
                     append_log("WARN", f"[Layer 2] 商品缓存异常: {str(e)[:80]}")
                 return ("cache", [])
 
-            # 并行启动三层搜索
+            async def _layer25_serpapi_search():
+                """Layer 2.5: SerpAPI Google Shopping (real-time real data with images)"""
+                try:
+                    from app.agent.serpapi_search import serpapi_product_search
+                    serpapi_products = await serpapi_product_search(
+                        user_query, top_k=5, timeout=5.0,
+                    )
+                    if serpapi_products:
+                        result = [_enrich_product(p) for p in serpapi_products]
+                        for p in result:
+                            p["source"] = p.get("source", "serpapi_shopping")
+                        append_log("INFO", f"[Layer 2.5] SerpAPI真实商品命中: {len(result)}件 "
+                                   f"(含真实图片={sum(1 for p in result if p.get('image_url'))})")
+                        return ("serpapi", result)
+                except Exception as e:
+                    append_log("WARN", f"[Layer 2.5] SerpAPI异常: {str(e)[:80]}")
+                return ("serpapi", [])
+
+            # v10: 官方电商平台 API（京东联盟/淘宝客/多多客）— 合法数据源
+            async def _layer26_official_api_search():
+                try:
+                    from app.agent.platform_adapters import search_all_platforms
+                    official_products = await search_all_platforms(user_query, top_k=5)
+                    if official_products:
+                        for p in official_products:
+                            p["source"] = p.get("source", "official_api")
+                        append_log("INFO", f"[Layer 2.6] 官方API命中: {len(official_products)}件")
+                        return ("official_api", official_products)
+                except Exception as e:
+                    append_log("DEBUG", f"[Layer 2.6] 官方API跳过: {type(e).__name__}")
+                return ("official_api", [])
+
+            # 并行启动搜索层（官方API + Hot Products + RAG + Cache + SerpAPI）
             parallel_results = await asyncio.gather(
+                _layer26_official_api_search(),
                 _layer0_search(),
                 _layer1_search(),
                 _layer2_search(),
+                _layer25_serpapi_search(),
                 return_exceptions=True,
             )
 
-            # 合并结果：按优先级 hot_products > rag > cache
-            l0_result = parallel_results[0] if not isinstance(parallel_results[0], Exception) else ("hot_products", [])
-            l1_result = parallel_results[1] if not isinstance(parallel_results[1], Exception) else ("rag", [], [])
-            l2_result = parallel_results[2] if not isinstance(parallel_results[2], Exception) else ("cache", [])
+            # 合并结果：按优先级 官方API > SerpAPI > hot_products > rag > cache
+            l26_result = parallel_results[0] if not isinstance(parallel_results[0], Exception) else ("official_api", [])
+            l0_result = parallel_results[1] if not isinstance(parallel_results[1], Exception) else ("hot_products", [])
+            l1_result = parallel_results[2] if not isinstance(parallel_results[2], Exception) else ("rag", [], [])
+            l2_result = parallel_results[3] if not isinstance(parallel_results[3], Exception) else ("cache", [])
+            l25_result = parallel_results[4] if len(parallel_results) > 4 and not isinstance(parallel_results[4], Exception) else ("serpapi", [])
 
             # Layer 0 结果
             _, hot_products = l0_result
@@ -721,9 +894,26 @@ async def run_pipeline(
             rag_docs = rag_docs_raw
             # Layer 2 结果
             _, cache_products = l2_result
+            # Layer 2.6 结果 (官方 API — 合法数据源，最高优先级)
+            _, official_products = l26_result
+            # Layer 2.5 结果 (SerpAPI — Google Shopping 数据)
+            _, serpapi_products = l25_result
 
-            # 优先级合并
-            if hot_products:
+            # 优先级合并：官方API > SerpAPI 真实数据 > 热门商品 > RAG > 缓存
+            if official_products:
+                products = official_products
+                source_type = "official_api"
+                search_layers_used.append("official_api")
+                review = {"verdict": f"数据来自电商平台官方API（{len(products)}件商品）",
+                          "pros": [], "cons": []}
+            elif serpapi_products:
+                products = serpapi_products
+                source_type = "serpapi_shopping"
+                search_layers_used.append("serpapi_shopping")
+                real_img = sum(1 for p in products if p.get("image_url"))
+                review = {"verdict": f"数据来自Google Shopping实时搜索（{len(products)}件商品，{real_img}件含真实图片）",
+                          "pros": [], "cons": []}
+            elif hot_products:
                 products = hot_products
                 source_type = "hot_products"
                 search_layers_used.append("hot_products")
@@ -751,19 +941,10 @@ async def run_pipeline(
                         search_layers_used.append("rag_variants")
                         review = {"verdict": "数据来自知识库（扩展查询）", "pros": [], "cons": []}
                         append_log("INFO", f"[Layer 1 variants] RAG扩展命中: {len(products)}件")
-                except Exception:
-                    pass
+                except Exception as e:
+                    append_log("WARN", f"[Layer 1 variants] RAG扩展搜索失败: {type(e).__name__}")
 
             timer.stop("parallel_layers")
-
-            # 记录并行搜索已使用的层
-            if hot_products:
-                search_layers_used.append("hot_products")
-            if rag_prods or products and source_type == "rag":
-                if "rag" not in search_layers_used:
-                    search_layers_used.append("rag")
-            if cache_products:
-                search_layers_used.append("product_cache")
 
         else:
             # ═══════════════════════════════════════════════════════
@@ -815,8 +996,8 @@ async def run_pipeline(
                             search_layers_used.append("trending_normalize")
                             review = {"verdict": "数据来自热门搜索匹配", "pros": [], "cons": []}
                             append_log("INFO", f"[Layer 0.5] 热门搜索匹配: {len(products)}件商品")
-                except Exception:
-                    pass
+                except Exception as e:
+                    append_log("DEBUG", f"Trending normalize skipped: {type(e).__name__}")
 
             # ── Layer 1: RAG Knowledge Base ──
             timer.start("layer1_rag")
@@ -858,6 +1039,28 @@ async def run_pipeline(
                 except Exception as e:
                     append_log("WARN", f"[Layer 2] 商品缓存异常: {str(e)[:80]}")
                 timer.stop("layer2_cache")
+
+            # ── Layer 2.5: SerpAPI Google Shopping (real-time data with real images) ──
+            if not products:
+                timer.start("layer25_serpapi")
+                try:
+                    from app.agent.serpapi_search import serpapi_product_search
+                    serpapi_products = await serpapi_product_search(
+                        user_query, top_k=5, timeout=5.0,
+                    )
+                    if serpapi_products:
+                        products = [_enrich_product(p) for p in serpapi_products]
+                        for p in products:
+                            p["source"] = p.get("source", "serpapi_shopping")
+                        source_type = "serpapi_shopping"
+                        search_layers_used.append("serpapi_shopping")
+                        real_img = sum(1 for p in products if p.get("image_url"))
+                        review = {"verdict": f"数据来自Google Shopping实时搜索（{len(products)}件商品，{real_img}件含真实图片）",
+                                  "pros": [], "cons": []}
+                        append_log("INFO", f"[Layer 2.5] SerpAPI真实商品命中: {len(products)}件 (含真实图片={real_img})")
+                except Exception as e:
+                    append_log("WARN", f"[Layer 2.5] SerpAPI异常: {str(e)[:80]}")
+                timer.stop("layer25_serpapi")
 
         # ── Layer 3: Live E-commerce Search ──
         if not products:
@@ -932,23 +1135,63 @@ async def run_pipeline(
                 append_log("WARN", f"[Layer 4] 相似搜索异常: {str(e)[:80]}")
             timer.stop("layer4_similar")
 
-        # ── Layer 5: Template Matching (simulated, last resort) ──
+        # ── Layer 5: Platform Search Links (v5.0 — category-aware) ──
         if not products:
-            timer.start("layer5_template")
-            template = match_template(user_query)
-            if template is not None:
-                t_products, t_review = template
-                for p in t_products:
-                    p["source"] = "simulated"
-                    p["confidence"] = 0.0
-                t_review["source"] = "simulated"
-                products, review = t_products, t_review
-                source_type = "simulated"
-                search_layers_used.append("template")
-                tracker.mark_simulated()
-                confidence_warning = "⚠️ 当前使用模拟数据，不反映真实市场价格。建议访问京东/天猫查看最新价格。"
-                append_log("WARN", "[Layer 5] 回退到模板（模拟数据），所有真实数据源均无结果")
-            timer.stop("layer5_template")
+            timer.start("layer5_platform_links")
+            from app.agent.real_commerce_engine import generate_platform_search_links
+            # v5.0: 使用类目约束的平台名称
+            platform_links = generate_platform_search_links(user_query)
+            # Add category-specific search URLs if category constraint exists
+            if category_constraint.is_valid and category_constraint.platforms:
+                from app.agent.category_mapper import PLATFORM_SEARCH_URLS
+                from urllib.parse import quote as url_quote
+                cat_links = []
+                for plat_name, cat_path in category_constraint.platforms.items():
+                    # Use the category-specific search path
+                    search_url = f"https://search.jd.com/Search?keyword={url_quote(user_query)}&enc=utf-8"
+                    if "京东" in plat_name:
+                        search_url = f"https://search.jd.com/Search?keyword={url_quote(user_query)}&enc=utf-8"
+                    elif "天猫" in plat_name:
+                        search_url = f"https://list.tmall.com/search_product.htm?q={url_quote(user_query)}"
+                    elif "拼多多" in plat_name:
+                        search_url = f"https://mobile.yangkeduo.com/search_result.html?search_key={url_quote(user_query)}"
+                    elif "得物" in plat_name:
+                        search_url = f"https://www.dewu.com/search?keyword={url_quote(user_query)}"
+                    elif "抖音" in plat_name:
+                        search_url = f"https://haohuo.jinritemai.com/views/search?keyword={url_quote(user_query)}"
+                    cat_links.append({
+                        "name": f"{plat_name}「{cat_path}」→ {user_query}",
+                        "platform": plat_name,
+                        "price": None,
+                        "price_display": "点击查看实时价格",
+                        "url": search_url,
+                        "image_url": "",
+                        "source": "platform_search_link",
+                        "confidence": 45.0,
+                        "is_search_link": True,
+                        "category_path": cat_path,
+                    })
+                if cat_links:
+                    platform_links = cat_links + platform_links
+
+            if platform_links:
+                products = platform_links
+                source_type = "platform_search_link"
+                search_layers_used.append("platform_search_link")
+                if category_constraint.is_valid:
+                    confidence_warning = (
+                        f"🔴 知识库中未找到「{category_constraint.subcategory}」类目的商品。"
+                        f"以下为{', '.join(list(category_constraint.platforms.keys())[:4])}的搜索链接。"
+                    )
+                else:
+                    confidence_warning = (
+                        "🔴 当前知识库中未找到该商品的实时价格数据。"
+                        "以下为京东/天猫/淘宝/拼多多/得物/识货的搜索链接，请点击查看最新价格。"
+                    )
+                review = {"verdict": "未找到实时数据，以下为各平台搜索链接", "pros": [], "cons": []}
+                append_log("INFO", f"[Layer 5] 平台搜索链接回退: {len(platform_links)}个平台 "
+                          f"(category={'on' if category_constraint.is_valid else 'off'})")
+            timer.stop("layer5_platform_links")
 
         # ── Layer 6: Entity-aware Search URL Generation (guaranteed fallback) ──
         if not products and entity_category_ok:
@@ -999,8 +1242,34 @@ async def run_pipeline(
             try:
                 from app.agent.popularity_scorer import re_rank
                 products = re_rank(user_query, products, entity=entity if entity_category_ok else None, top_k=max(5, len(products)))
-            except Exception:
-                pass
+            except Exception as e:
+                append_log("WARN", f"Re-rank failed: {type(e).__name__}")
+
+        # ── v5.0 Category Lock Filter — 强制类目过滤 ──
+        if products and category_constraint.is_valid:
+            matched, rejected = filter_by_category(products, category_constraint)
+            if rejected:
+                append_log(
+                    "WARN",
+                    f"Category Lock 过滤 {len(rejected)}/{len(products)} 件跨类目商品: "
+                    + ", ".join(
+                        f"{r.get('name','?')[:30]}({r.get('category','?')})"
+                        for r in rejected[:3]
+                    ),
+                )
+            if not matched:
+                # 所有商品均被类目过滤 → 清空 products，触发平台链接回退
+                append_log("WARN",
+                    f"Category Lock: ALL {len(products)} products rejected "
+                    f"(constraint={category_constraint.primary}/{category_constraint.subcategory})")
+                products = []
+                source_type = "none"
+                confidence_warning = (
+                    f"🔴 搜索到的商品均不属于「{category_constraint.subcategory}」类目，已被过滤。"
+                    f"以下为{category_constraint.platforms.get('京东','京东')}等平台搜索链接。"
+                )
+            else:
+                products = matched
 
         # ── Post-search: Validate & Compute ──
         if products:
@@ -1016,18 +1285,52 @@ async def run_pipeline(
                     append_log("WARN", f"Post-search validation rejected {validation_report.total_rejected} "
                               f"cross-category results (kept {validation_report.total_accepted})")
 
-            # GUARANTEED RETURN RULE: if we have products after validation, always return them
+            # ═══════════════════════════════════════════════════════════
+            # v4.0 Real Commerce Engine — 数据质量门禁 + 购物决策
+            # ═══════════════════════════════════════════════════════════
             if products:
-                # Verify data (skip for link_fallback — those are just URLs)
-                if source_type != "link_fallback":
-                    verifications = await verifier.verify_product_claims(products)
-                    confidence_score = DataVerifier.aggregate_confidence(verifications)
-                else:
-                    confidence_score = 8.0
+                from app.agent.real_commerce_engine import (
+                    process_commerce_results, DataQualityGate,
+                )
 
-                # Override confidence for simulated data
+                commerce_result = await process_commerce_results(
+                    products=products,
+                    query=user_query,
+                    search_layers_used=search_layers_used,
+                    data_source=source_type,
+                )
+
+                # 替换 products 为通过质量门禁的商品
+                products = commerce_result["valid_products"]
+                quality_report = commerce_result["quality_report"]
+                platform_links = commerce_result["platform_links"]
+                shopping_decision = commerce_result["decision"]
+
+                # 如果有效商品被全部过滤，使用平台搜索链接作为回退
+                if not products and platform_links:
+                    products = platform_links
+                    source_type = "platform_search_link"
+                    search_layers_used.append("platform_search_link")
+                    confidence_warning = (
+                        "🔴 未找到具有有效价格的商品。以下为各平台搜索链接，请点击查看实时价格。"
+                    )
+                    append_log("WARN", f"RealCommerceEngine: all products rejected, "
+                              f"using {len(platform_links)} platform search links as fallback")
+
+                # 更新可信度
+                if source_type != "link_fallback" and products:
+                    confidence_score = quality_report.get("passed", 0) / max(
+                        quality_report.get("total_raw", 1), 1
+                    ) * 80.0  # 基础分：通过率 × 80
+                    if quality_report.get("has_real_price"):
+                        confidence_score = min(confidence_score + 15, 95.0)
+                    if quality_report.get("has_real_image"):
+                        confidence_score = min(confidence_score + 5, 100.0)
+
+                # 覆盖模拟数据可信度
                 if source_type == "simulated":
                     confidence_score = 0.0
+                    confidence_warning = "🔴 模拟数据不可用 — 已被真实数据引擎过滤。请尝试其他搜索词。"
                 elif source_type == "similar":
                     confidence_score = min(confidence_score, 60.0)
 
@@ -1047,13 +1350,14 @@ async def run_pipeline(
                 append_log(
                     "INFO",
                     f"pipeline v6 完成搜索: {len(products)}件商品 "
+                    f"(通过质量门禁: {quality_report.get('passed',0)}/"
+                    f"{quality_report.get('total_raw',0)}) "
                     f"layers={search_layers_used} "
                     f"source={source_type} "
-                    f"confidence={confidence_score:.0f}% "
-                    f"entity={entity.brand if entity else 'none'}/{entity.category if entity else 'none'}",
+                    f"confidence={confidence_score:.0f}%",
                 )
             else:
-                # All products rejected by validation — this is the true not_found case
+                # All products rejected by validation
                 confidence_score = 0.0
                 confidence_warning = (
                     "🔴 搜索到的商品均因品牌/分类不匹配被过滤。"
@@ -1062,6 +1366,7 @@ async def run_pipeline(
                 source_type = "none"
                 search_layers_used.append("validation_rejected")
                 products = []
+                shopping_decision = None
         else:
             # ── Absolutely no data: ALL layers failed ──
             confidence_score = 0.0
@@ -1072,18 +1377,27 @@ async def run_pipeline(
             source_type = "none"
             tracker.add("所有搜索渠道均未找到商品", source_type="unknown", source_name="无")
             search_layers_used.append("none")
+            shopping_decision = None
             append_log("WARN", "pipeline v6 所有搜索层均失败 — 返回 not_found")
 
     # ── LLM Summarization ──
+    # V2.0 intents: buy_product, compare_products, recommend_products, price_check,
+    #   product_review, shopping_guide, trend_analysis, knowledge_qa, general_chat
+    SHOPPING_INTENTS = {
+        "buy_product", "compare_products", "recommend_products",
+        "price_check", "trend_analysis", "shopping", "product_query",
+    }
     timer.start("llm_summarize")
-    if source_type == "none" and intent in ("shopping", "product_query"):
+    # v10: LLM 使用完整 messages 数组（含多轮历史），搜索已用纯净 query
+    if source_type == "none" and intent in SHOPPING_INTENTS:
         # No data — generate helpful not_found message
         review_text, _, llm_ms = await rag_summarize(
             user_query, [], intent, user_id, stream_callback, source_type="none",
+            chat_history=chat_history,
         )
         timer.record("llm_summarize", llm_ms)
         review = {"verdict": review_text, "pros": [], "cons": []}
-    elif products and intent in ("shopping", "product_query"):
+    elif products and intent in SHOPPING_INTENTS:
         # Products found — summarize them
         # Build context from products + RAG docs
         summarize_context = list(products[:5])
@@ -1092,6 +1406,7 @@ async def run_pipeline(
         review_text, _, llm_ms = await rag_summarize(
             user_query, summarize_context, intent, user_id,
             stream_callback, source_type=source_type,
+            chat_history=chat_history,
         )
         timer.record("llm_summarize", llm_ms)
         if review_text:
@@ -1107,12 +1422,32 @@ async def run_pipeline(
     if not confidence_warning:
         confidence_warning = ConfidenceScorer.get_warning(confidence_score)
 
+    # ── v4.0 Shopping Decision (Real Commerce Engine) ──
+    shopping_decision_dict: dict | None = None
+    if shopping_decision is not None:
+        from dataclasses import asdict
+        try:
+            shopping_decision_dict = asdict(shopping_decision)
+        except TypeError:
+            shopping_decision_dict = {
+                "recommendation": shopping_decision.recommendation,
+                "confidence_level": shopping_decision.confidence_level,
+                "best_product": shopping_decision.best_product,
+                "best_platform": shopping_decision.best_platform,
+                "best_price": shopping_decision.best_price,
+                "reasons": shopping_decision.reasons,
+                "risks": shopping_decision.risks,
+                "purchase_advice": shopping_decision.purchase_advice,
+                "promo_advice": shopping_decision.promo_advice,
+            }
+
     final_report = generate_report(
         products, price_analysis, decision, user_query,
         rag_summary=review.get("verdict", ""),
         citation_block=citation_block,
         confidence_score=confidence_score,
         confidence_warning=confidence_warning,
+        shopping_decision=shopping_decision_dict,
     )
     timer.stop("compute")
 
@@ -1137,8 +1472,26 @@ async def run_pipeline(
             graph_node = find_node_by_model(entity.product)
             if graph_node:
                 graph_suggestions = suggest_similar(graph_node.id, top_k=3)
-        except Exception:
-            pass
+        except Exception as e:
+            append_log("DEBUG", f"Product graph suggestions skipped: {type(e).__name__}")
+
+    # ── Add data freshness metadata to products ──
+    now_ts = time.time()
+    for p in products:
+        if "data_cached_at" not in p:
+            p["data_cached_at"] = now_ts
+
+    # ── Build data freshness warning ──
+    data_freshness_warning: str | None = None
+    if source_type in ("hot_products", "product_cache", "cache", "rag"):
+        # Static data sources — add freshness note
+        data_freshness_warning = (
+            "⚠️ 此数据来自产品数据库缓存，非实时价格。"
+            "实际价格可能因促销活动而变动，建议点击链接查看最新报价。"
+        )
+    elif source_type in ("serpapi_shopping", "live_search"):
+        # Real-time sources
+        data_freshness_warning = None  # No warning needed
 
     result = {
         "intent": intent,
@@ -1148,6 +1501,7 @@ async def run_pipeline(
         "price_analysis": price_analysis,
         "review_summary": review,
         "decision": decision,
+        "shopping_decision": shopping_decision_dict,
         "final_report": final_report,
         "perf": timer.report(),
         "confidence": confidence_score,
@@ -1159,9 +1513,15 @@ async def run_pipeline(
         "entity": entity.to_dict() if entity else {},
         "graph_suggestions": graph_suggestions,
         "fast_mode": route_cfg.fast_mode,
+        "data_cached_at": now_ts,
+        "data_freshness_warning": data_freshness_warning,
     }
 
-    # ── Cache result ──
+    # ── v2.0 Semantic Cache write ──
+    from app.agent.semantic_cache import semantic_cache as sc
+    asyncio.create_task(sc.set(user_query, result))
+
+    # ── Legacy cache ──
     _result_cache[rk] = (time.time() + _RESULT_CACHE_TTL, result)
     try:
         from app.cache.redis_cache import get_cache
@@ -1171,8 +1531,8 @@ async def run_pipeline(
             {**result, "expiry": time.time() + _RESULT_CACHE_TTL},
             ttl=_RESULT_CACHE_TTL,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        append_log("DEBUG", f"Redis cache write skipped: {type(e).__name__}")
 
     append_log(
         "SUCCESS",

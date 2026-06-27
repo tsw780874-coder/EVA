@@ -203,6 +203,107 @@ async def query_memories(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# v10: 会话自动摘要 — 对话结束后生成摘要存入长期记忆
+# ═══════════════════════════════════════════════════════════════════════
+
+
+async def auto_summarize_session(
+    user_id: str,
+    session_id: str,
+    query: str,
+    reply: str,
+) -> int:
+    """对话结束后自动提取关键事实并存入记忆。
+
+    使用 LLM 从用户 query + 助手 reply 中提取:
+      - 用户偏好（品牌、预算、用途）
+      - 已确认的选择/决定
+      - 关键比价结论
+
+    提取结果存入 MySQL Memory + 同步到 Milvus。
+    """
+    try:
+        from app.agent.llm_utils import llm_call
+        from app.models.memory import Memory
+
+        # 轻量 LLM 提取
+        extract_prompt = (
+            "你是一个信息提取助手。从以下对话中提取用户的关键偏好和决策。\n"
+            "用 JSON 格式返回，只返回 JSON，不要其他内容。\n"
+            '格式: {"preferences": [...], "decisions": [...], "facts": [...]}\n'
+            "每个条目不超过30字。如果没有则返回空数组。"
+        )
+        extract_input = f"用户: {query[:300]}\n助手: {reply[:500]}"
+
+        content, _, _ = await llm_call(
+            system_prompt=extract_prompt,
+            user_message=extract_input,
+            max_tokens=200,
+            temperature=0.1,
+            user_id=user_id,
+            node_name="memory_extract",
+            bypass_cache=True,
+        )
+
+        import json as _json
+        try:
+            # 尝试解析 JSON
+            start = content.find("{")
+            end = content.rfind("}") + 1
+            if start >= 0 and end > start:
+                extracted = _json.loads(content[start:end])
+            else:
+                return 0
+        except _json.JSONDecodeError:
+            return 0
+
+        # 存入 Memory
+        from app.core.database import async_session
+        saved = 0
+        async with async_session() as db:
+            for category, items in extracted.items():
+                if not isinstance(items, list):
+                    continue
+                for item in items[:3]:  # 每类最多3条
+                    if not isinstance(item, str) or len(item) < 3:
+                        continue
+                    mem = Memory(
+                        user_id=user_id,
+                        key=f"auto_{category}",
+                        value={
+                            "content": item,
+                            "session_id": session_id,
+                            "memory_type": "preference" if category == "preferences" else "confirmed_fact",
+                            "source": "auto_summarize",
+                        },
+                        importance=0.5,
+                    )
+                    db.add(mem)
+                    saved += 1
+            if saved > 0:
+                await db.commit()
+
+        # 异步同步到 Milvus
+        if saved > 0:
+            try:
+                from app.services.vector_memory import store_vector_memories
+                facts = [
+                    {"key": f"auto_{k}", "value": {"preference": v}, "memory_type": "auto", "importance": 0.5, "source": "auto"}
+                    for k, items in extracted.items() if isinstance(items, list)
+                    for v in items[:3] if isinstance(v, str)
+                ]
+                if facts:
+                    await store_vector_memories(user_id, facts)
+            except Exception:
+                pass
+
+        return saved
+
+    except Exception:
+        return 0
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Memory Consolidation (Redis → MySQL + Milvus)
 # ═══════════════════════════════════════════════════════════════════════
 

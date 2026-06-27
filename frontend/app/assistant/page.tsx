@@ -5,13 +5,15 @@ import {
   Plus, MessageSquare, LayoutGrid, Settings, Send,
   Layers, Zap, ShieldCheck, Globe2, Loader2,
   Heart, ExternalLink, Star, Menu, X,
-  Database, Brain, Globe, Wrench, AlertTriangle
+  Database, Brain, Globe, Wrench, AlertTriangle,
+  GitCompare, CheckSquare, Square
 } from 'lucide-react';
 import Link from 'next/link';
 import { Great_Vibes } from 'next/font/google';
 import { useChatStore, type SSEEvent, type ProductData, type HybridSourceInfo } from '@/stores/chatStore';
 import { useAuthStore } from '@/stores/authStore';
 import { api } from '@/lib/api';
+import { MessageItem, type DisplayMessage } from '@/components/LoevenChat';
 
 const greatVibes = Great_Vibes({
   weight: '400',
@@ -25,20 +27,15 @@ const SUGGESTED_QUERIES = [
   "分析近期唯品会美妆优惠趋势"
 ];
 
-interface DisplayMessage {
-  role: 'user' | 'assistant' | 'agent';
-  content: string;
-  agentName?: string;
-}
-
 export default function ChatStudio() {
   const [inputText, setInputText] = useState("");
   const [displayMessages, setDisplayMessages] = useState<DisplayMessage[]>([]);
-  const [products, setProducts] = useState<ProductData[]>([]);
-  const [favoritedIds, setFavoritedIds] = useState<Set<string>>(new Set());
   const [favoritingId, setFavoritingId] = useState<string | null>(null);
   const [streamingText, setStreamingText] = useState("");  // token-level streaming
   const [sidebarOpen, setSidebarOpen] = useState(false);    // mobile sidebar toggle
+  const [favError, setFavError] = useState<string | null>(null);  // favorite error feedback
+  const [compareIds, setCompareIds] = useState<Set<string>>(new Set());  // v10: 对比选择
+  const [showCompare, setShowCompare] = useState(false);  // v10: 对比面板
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const user = useAuthStore((s) => s.user);
@@ -48,7 +45,12 @@ export default function ChatStudio() {
     loadSessions, createSession, sendMessage, toggleHybrid,
     selectSession, deleteSession,
     updateHybrid, resetHybrid,
+    productsBySession, setProducts,
+    favoritedIds, addFavoritedId,
   } = useChatStore();
+
+  // Derive products from store (keyed by current session)
+  const products = currentSession?.id ? (productsBySession[currentSession.id] || []) : [];
 
   useEffect(() => { loadSessions().catch(() => {}); }, []);
   useEffect(() => {
@@ -60,6 +62,7 @@ export default function ChatStudio() {
 
   const handleFavorite = async (p: ProductData) => {
     setFavoritingId(p.id);
+    setFavError(null);
     try {
       await api("/api/v1/favorites", {
         method: "POST",
@@ -72,10 +75,15 @@ export default function ChatStudio() {
           product_image_url: p.image_url || "",
         }),
       });
-      setFavoritedIds(prev => new Set(prev).add(p.id));
+      addFavoritedId(p.id);
     } catch (err: unknown) {
-      if ((err as Error).message?.includes("409") || (err as Error).message?.includes("已收藏")) {
-        setFavoritedIds(prev => new Set(prev).add(p.id));
+      const msg = (err as Error).message || "";
+      if (msg.includes("409") || msg.includes("已收藏")) {
+        addFavoritedId(p.id);
+      } else if (msg.includes("认证已过期")) {
+        setFavError("认证已过期，请刷新页面后重试");
+      } else {
+        setFavError(`收藏失败：${msg || "请检查网络连接后重试"}`);
       }
     }
     setFavoritingId(null);
@@ -84,14 +92,17 @@ export default function ChatStudio() {
   const handleSelectSession = async (session: typeof sessions[0]) => {
     if (currentSession?.id === session.id) return;
     await selectSession(session.id);
-    const msgs = useChatStore.getState().messages;
+    const state = useChatStore.getState();
+    const msgs = state.messages;
     const displayMsgs: DisplayMessage[] = msgs.map((m) => ({
       role: m.role as DisplayMessage['role'],
       content: m.content,
     }));
     setDisplayMessages(displayMsgs);
-    setProducts([]);
+    // Products are now per-session in store — they persist across session switches
+    // No need to clear products; they're derived from productsBySession[currentSession.id]
     setStreamingText("");
+    setFavError(null);
     resetHybrid();
   };
 
@@ -99,9 +110,10 @@ export default function ChatStudio() {
     await deleteSession(sessionId);
     if (currentSession?.id === sessionId) {
       setDisplayMessages([]);
-      setProducts([]);
       setStreamingText("");
+      setFavError(null);
       resetHybrid();
+      // Products for this session will be garbage-collected by store
     }
   };
 
@@ -110,116 +122,100 @@ export default function ChatStudio() {
     if (!content.trim() || isStreaming) return;
     setInputText('');
     setDisplayMessages((prev) => [...prev, { role: 'user', content }]);
-    setProducts([]);
     setStreamingText("");
+    setFavError(null);
     resetHybrid();
 
-    // --- Instant thinking indicator (don't wait for SSE) ---
+    // ChatGPT-style: 添加 streaming assistant 消息（带初始文案）
     setDisplayMessages((prev) => [
       ...prev,
-      { role: 'agent', content: '正在多源分析您的需求...', agentName: 'think' },
+      { role: 'assistant', content: '正在多源分析您的需求...' },
     ]);
+
+    let finalized = false;  // 防止 final_report 重复渲染
+
+    // Token append helper — 直接不可变更新，每 token 触发一次 setState
+    // React 18 自动批处理，不会造成性能问题
+    const appendToken = (text: string) => {
+      setDisplayMessages((prev) => {
+        const last = prev[prev.length - 1];
+        if (!last || last.role !== 'assistant') return prev;
+        return [...prev.slice(0, -1), { ...last, content: (last.content || '') + text }];
+      });
+    };
 
     let sessionId = currentSession?.id;
     if (!sessionId) {
-      const session = await createSession(content.slice(0, 30));
-      sessionId = session.id;
+      try {
+        const session = await createSession(content.slice(0, 30));
+        sessionId = session.id;
+      } catch (err) {
+        // 创建会话失败 - 替换 streaming placeholder 为错误提示
+        setDisplayMessages((prev) => {
+          const clean = prev.filter(m => m.role !== 'assistant' || m.content !== '');
+          return [...clean, { role: 'assistant', content: '⚠️ 无法创建对话会话，请检查网络连接后重试。' }];
+        });
+        console.error('[handleSend] createSession failed:', err);
+        return;
+      }
     }
 
-    // Track streaming tokens for progressive display
-    let tokenBuffer = "";
-
+    // ChatGPT-style: 每收到 token 直接追加到 displayMessages 最后一条
+    try {
     await sendMessage(sessionId, content, (event: SSEEvent) => {
-      if (event.type === 'agent_start') {
+      // ── Token: 直接不可变追加到 displayMessages 最后一条 assistant ──
+      if (event.type === 'token' && event.text) {
+        appendToken(event.text);
+      }
+
+      // ── Products arrive → persist to store (keyed by session) ──
+      if (event.type === 'agent_result' && event.products && !finalized) {
+        setProducts(sessionId!, event.products);
+      }
+
+      // ── Final report → 替换最后一条消息的 content 为 markdown ──
+      if (event.type === 'final_report' && !finalized) {
+        finalized = true;
         setDisplayMessages((prev) => {
-          const filtered = prev.filter(m => !(m.role === 'agent' && m.agentName === 'think'));
-          return [...filtered, { role: 'agent', content: event.message || '正在多源分析...', agentName: 'think' }];
+          const rest = prev.slice(0, -1);
+          return [...rest, { role: 'assistant', content: event.markdown || '' }];
         });
+        if (event.markdown?.includes('购物决策报告')) {
+          updateHybrid({ confLevel: 'final' });
+        }
       }
 
-      if (event.type === 'token') {
-        tokenBuffer += (event.text || "");
-        setStreamingText(tokenBuffer);
-      }
-
-      if (event.type === 'agent_result' && event.agent === 'search_agent' && event.products) {
-        setProducts(event.products);
-        setStreamingText("");
-        tokenBuffer = "";
-      }
-
-      if (event.type === 'agent_progress') {
+      // ── Error event → replace last message with error ──
+      if (event.type === 'error' && !finalized) {
+        finalized = true;
         setDisplayMessages((prev) => {
-          const filtered = prev.filter(m =>
-            !(m.role === 'agent' && (m.agentName === 'think' || m.agentName === 'streaming'))
-          );
-          return [...filtered, { role: 'agent', content: event.message || '', agentName: event.agent }];
+          const rest = prev.slice(0, -1);
+          return [...rest, { role: 'assistant', content: `⚠️ 服务异常：${event.message || '未知错误'}，请稍后重试。` }];
         });
       }
 
-      // ── Hybrid AI v7 events ──
-      if (event.type === 'hybrid_sources' && event.sources) {
-        updateHybrid({ sources: event.sources });
-      }
-
-      if (event.type === 'hybrid_confidence') {
-        updateHybrid({
-          confidence: event.confidence || 0,
-          confLevel: event.level || "",
-          confBreakdown: event.breakdown || {},
-        });
-      }
-
-      if (event.type === 'hybrid_conflict' && event.conflicts) {
-        updateHybrid({ conflicts: event.conflicts });
-      }
-
-      if (event.type === 'hybrid_guard') {
-        updateHybrid({
-          hallucinationPassed: event.passed ?? true,
-          warnings: event.warnings || [],
-        });
-      }
-
+      // ── Trust/perf → 静默更新 store（不触发 UI rerender）──
       if (event.type === 'trust') {
         updateHybrid({
           confidence: event.confidence || 0,
-          confLevel: event.level || "",
-          conflicts: event.conflicts || [],
           hallucinationPassed: event.hallucination_passed ?? true,
         });
       }
-
-      if (event.type === 'verification') {
-        updateHybrid({
-          verification: {
-            passed: !!event.passed,
-            action: (event.action as string) || "allow",
-            confidence: (event.confidence as number) || 0,
-            failedChecks: (event.failed_checks as string[]) || [],
-            warnings: (event.warnings as string[]) || [],
-          },
-        });
-      }
-
       if (event.type === 'perf' && event.timing) {
         updateHybrid({ perfTiming: event.timing });
       }
-
-      if (event.type === 'final_report') {
-        setStreamingText("");
-        tokenBuffer = "";
-        setDisplayMessages((prev) => {
-          const filtered = prev.filter(m =>
-            !(m.role === 'agent' && (m.agentName === 'think' || m.agentName === 'streaming'))
-          );
-          return [...filtered, { role: 'assistant', content: event.markdown || '' }];
-        });
-      }
     }, () => {
+      finalized = false;
       loadSessions().catch(() => {});
-      setStreamingText("");
     });
+    } catch (err) {
+      // sendMessage 自身失败 → 替换 streaming placeholder 为错误
+      setDisplayMessages((prev) => {
+        const clean = prev.filter(m => m.role !== 'assistant' || m.content !== '');
+        return [...clean, { role: 'assistant', content: '⚠️ 消息发送失败，请检查网络连接后重试。' }];
+      });
+      console.error('[handleSend] sendMessage failed:', err);
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -231,13 +227,13 @@ export default function ChatStudio() {
 
   const platformColor = (platform: string) => {
     const map: Record<string, string> = {
-      "京东": "bg-red-50 text-red-600 border-red-100",
-      "天猫": "bg-red-50 text-red-500 border-red-100",
-      "淘宝": "bg-orange-50 text-orange-600 border-orange-100",
-      "得物": "bg-indigo-50 text-indigo-600 border-indigo-100",
-      "拼多多": "bg-yellow-50 text-yellow-600 border-yellow-100",
+      "京东": "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
+      "天猫": "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
+      "淘宝": "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
+      "得物": "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
+      "拼多多": "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
     };
-    return map[platform] || "bg-gray-50 text-gray-600 border-gray-100";
+    return map[platform] || "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]";
   };
 
   return (
@@ -277,8 +273,8 @@ export default function ChatStudio() {
 
         <div className="px-4 mb-4">
           <button
-            onClick={() => { setDisplayMessages([]); setProducts([]); createSession(); }}
-            className="w-full py-2 px-4 rounded-full border border-black/[0.05] bg-white shadow-sm flex items-center justify-center gap-2 text-xs font-bold hover:bg-black hover:text-white transition-all"
+            onClick={() => { setDisplayMessages([]); setFavError(null); createSession(); }}
+            className="w-full py-2 px-4 border border-black/10 bg-white flex items-center justify-center gap-2 text-xs font-bold hover:bg-black hover:text-white transition-all"
           >
             <Plus size={14} /> 新建对话
           </button>
@@ -339,17 +335,17 @@ export default function ChatStudio() {
             {user && (
               <span className="text-xs text-gray-400">👋 {user.name}</span>
             )}
-            <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-green-50 text-[10px] font-bold text-green-600 border border-green-100">
-              <span className="w-1.5 h-1.5 rounded-full bg-green-500" />
+            <div className="flex items-center gap-2 px-3 py-1 bg-[#F9F8F6] text-[10px] font-bold text-[#8C7A6B] border border-[#D4C9BC]">
+              <span className="w-1.5 h-1.5 bg-[#8C7A6B]" />
               AGENT ACTIVE
             </div>
-            {/* Hybrid v7 toggle */}
+            {/* Hybrid toggle with earthy styling */}
             <button
               onClick={toggleHybrid}
-              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[9px] font-bold border transition-all ${
+              className={`flex items-center gap-1.5 px-2.5 py-1 text-[9px] font-bold border transition-all ${
                 useHybrid
-                  ? "bg-indigo-50 text-indigo-600 border-indigo-100"
-                  : "bg-gray-50 text-gray-400 border-gray-100"
+                  ? "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]"
+                  : "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]"
               }`}
               title={useHybrid ? "Hybrid V7: 多源智能已启用" : "使用经典 V6 模式"}
             >
@@ -369,11 +365,11 @@ export default function ChatStudio() {
                     reasoning: <Layers size={10} />,
                   };
                   const colors: Record<string, string> = {
-                    web: "bg-blue-50 text-blue-600 border-blue-100",
-                    rag: "bg-purple-50 text-purple-600 border-purple-100",
-                    memory: "bg-amber-50 text-amber-600 border-amber-100",
-                    tool: "bg-emerald-50 text-emerald-600 border-emerald-100",
-                    reasoning: "bg-gray-50 text-gray-500 border-gray-100",
+                    web: "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
+                    rag: "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
+                    memory: "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
+                    tool: "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
+                    reasoning: "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
                   };
                   return (
                     <span key={s.source} className={`px-1.5 py-0.5 rounded text-[9px] font-bold border flex items-center gap-0.5 ${colors[s.source] || colors.reasoning}`}>
@@ -393,17 +389,17 @@ export default function ChatStudio() {
         <div className="flex-1 overflow-y-auto px-4 md:px-8 py-8 md:py-12 space-y-8 md:space-y-10">
           {displayMessages.length === 0 && (
             <div className="max-w-3xl mx-auto flex gap-6">
-              <div className="w-10 h-10 rounded-2xl bg-gradient-to-tr from-indigo-500 to-sky-400 flex items-center justify-center text-white shrink-0 shadow-lg shadow-indigo-100">
-                <Zap size={20} fill="white" />
+              <div className="w-10 h-10 flex items-center justify-center shrink-0 border border-black/10 bg-[#F9F8F6] text-[#8C7A6B]">
+                <span className="font-serif italic text-sm">E</span>
               </div>
               <div className="space-y-4">
                 <h2 className="text-2xl md:text-3xl font-serif italic text-black">您好，我是 EVA。</h2>
-                <p className="text-base md:text-lg text-gray-500 leading-relaxed">
+                <p className="text-base md:text-lg text-[#3a3a3a] leading-[1.8] font-light">
                   我已连接多个主流电商平台。您可以发送商品链接或描述采购需求，我将为您进行深度比价和趋势分析。
                 </p>
                 <div className="grid grid-cols-1 gap-2 pt-4">
                   {SUGGESTED_QUERIES.map((q, i) => (
-                    <button key={i} onClick={() => handleSend(q)} className="text-left px-5 py-3 rounded-2xl border border-black/[0.04] text-sm text-gray-600 hover:bg-black hover:text-white transition-all w-full md:w-fit">
+                    <button key={i} onClick={() => handleSend(q)} className="text-left px-5 py-3 border border-black/10 text-sm text-[#3a3a3a] hover:bg-black hover:text-white transition-all w-full md:w-fit">
                       {q}
                     </button>
                   ))}
@@ -412,24 +408,48 @@ export default function ChatStudio() {
             </div>
           )}
 
+          {/* 收藏错误提示 */}
+          {favError && (
+            <div className="max-w-3xl mx-auto">
+              <div className="bg-red-50 border border-red-200 p-3 flex items-center gap-2 text-xs text-red-700">
+                <AlertTriangle size={14} />
+                {favError}
+                <button onClick={() => setFavError(null)} className="ml-auto text-red-400 hover:text-red-700">
+                  <X size={14} />
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* 商品卡片区 */}
           {products.length > 0 && (
             <div className="max-w-3xl mx-auto">
-              <p className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest mb-4">
-                搜索到 {products.length} 个商品
-              </p>
+              <div className="flex items-center justify-between mb-4">
+                <p className="text-[10px] font-bold text-[#8C7A6B] uppercase tracking-[0.2em]">
+                  搜索到 {products.length} 个商品
+                </p>
+                {compareIds.size >= 2 && (
+                  <button
+                    onClick={() => setShowCompare(true)}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-bold bg-black text-white hover:bg-neutral-800 transition-all"
+                  >
+                    <GitCompare size={12} />
+                    对比已选 ({compareIds.size})
+                  </button>
+                )}
+              </div>
               <div className="grid grid-cols-1 gap-4">
                 {products.map((p) => {
-                  const isFaved = favoritedIds.has(p.id);
+                  const isFaved = favoritedIds.includes(p.id);
                   const isFaving = favoritingId === p.id;
                   return (
                     <motion.div
                       key={p.id}
                       initial={{ opacity: 0, y: 12 }}
                       animate={{ opacity: 1, y: 0 }}
-                      className="bg-white border border-black/[0.06] rounded-2xl p-4 md:p-5 flex items-start gap-4 hover:shadow-lg hover:border-black/[0.12] transition-all group"
+                      className="bg-white border border-black/[0.06] p-4 md:p-5 flex items-start gap-4 hover:shadow-lg hover:border-black/[0.12] transition-all group"
                     >
-                      <div className="w-16 h-16 rounded-xl bg-gray-50 shrink-0 flex items-center justify-center overflow-hidden">
+                      <div className="w-16 h-16 bg-[#F9F8F6] shrink-0 flex items-center justify-center overflow-hidden">
                         {p.image_url ? (
                           <img
                             src={p.image_url}
@@ -441,7 +461,7 @@ export default function ChatStudio() {
                             }}
                           />
                         ) : null}
-                        <span className={`text-[10px] font-bold text-gray-400 ${p.image_url ? 'hidden' : ''}`}>
+                        <span className={`text-[10px] font-bold text-[#8C7A6B] ${p.image_url ? 'hidden' : ''}`}>
                           {p.platform.slice(0, 2)}
                         </span>
                       </div>
@@ -451,36 +471,36 @@ export default function ChatStudio() {
                           <div>
                             <h4 className="font-bold text-sm leading-snug">{p.name}</h4>
                             <div className="flex items-center gap-2 mt-1.5">
-                              <span className={`px-2 py-0.5 rounded-full text-[9px] font-bold border ${platformColor(p.platform)}`}>
+                              <span className={`px-2 py-0.5 text-[9px] font-bold border ${platformColor(p.platform)}`}>
                                 {p.platform}
                               </span>
                               {p.rating && (
-                                <span className="text-[10px] text-gray-400">⭐ {p.rating}</span>
+                                <span className="text-[10px] text-[#8C7A6B]">⭐ {p.rating}</span>
                               )}
                               {p.review_count && (
-                                <span className="text-[10px] text-gray-400">{p.review_count} 评价</span>
+                                <span className="text-[10px] text-[#8C7A6B]">{p.review_count} 评价</span>
                               )}
                             </div>
                           </div>
                           <div className="text-right shrink-0">
                             <p className="text-xl font-black tracking-tight text-black">
-                              ¥{p.price?.toLocaleString()}
+                              {p.price ? `¥${p.price.toLocaleString()}` : (p as any).price_display || '点击查看'}
                             </p>
-                            {p.original_price && p.original_price > p.price && (
-                              <p className="text-xs text-gray-400 line-through">
+                            {p.original_price && p.price && p.original_price > p.price && (
+                              <p className="text-xs text-[#8C7A6B] line-through">
                                 ¥{p.original_price?.toLocaleString()}
                               </p>
                             )}
                           </div>
                         </div>
 
-                        <div className="flex items-center gap-3 mt-3 pt-3 border-t border-black/[0.03]">
+                        <div className="flex items-center gap-3 mt-3 pt-3 border-t border-black/[0.03] flex-wrap">
                           {p.url && (
                             <a
                               href={p.url}
                               target="_blank"
                               rel="noopener noreferrer"
-                              className="flex items-center gap-1 text-[10px] font-bold text-gray-400 hover:text-black transition-colors"
+                              className="flex items-center gap-1 text-[10px] font-bold text-[#8C7A6B] hover:text-black transition-colors"
                             >
                               <ExternalLink size={12} /> 查看商品
                             </a>
@@ -488,10 +508,10 @@ export default function ChatStudio() {
                           <button
                             onClick={() => handleFavorite(p)}
                             disabled={isFaved || isFaving}
-                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[10px] font-bold transition-all ${
+                            className={`flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-bold transition-all border ${
                               isFaved
-                                ? "bg-red-50 text-red-500 border border-red-100"
-                                : "bg-gray-50 text-gray-500 border border-gray-100 hover:bg-red-50 hover:text-red-500 hover:border-red-100"
+                                ? "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]"
+                                : "bg-[#F9F8F6] text-[#8C7A6B] border-black/5 hover:bg-black hover:text-white hover:border-black"
                             } disabled:opacity-50`}
                           >
                             {isFaving ? (
@@ -500,6 +520,25 @@ export default function ChatStudio() {
                               <Heart size={12} fill={isFaved ? "currentColor" : "none"} />
                             )}
                             {isFaved ? "已收藏" : "收藏"}
+                          </button>
+                          {/* v10: 对比选择 */}
+                          <button
+                            onClick={() => {
+                              setCompareIds(prev => {
+                                const next = new Set(prev);
+                                if (next.has(p.id)) next.delete(p.id);
+                                else if (next.size < 4) next.add(p.id);
+                                return next;
+                              });
+                            }}
+                            className={`flex items-center gap-1 px-2 py-1 text-[10px] font-bold border transition-all ${
+                              compareIds.has(p.id)
+                                ? "bg-black text-white border-black"
+                                : "bg-[#F9F8F6] text-[#8C7A6B] border-black/5 hover:border-black"
+                            }`}
+                          >
+                            {compareIds.has(p.id) ? <CheckSquare size={12} /> : <Square size={12} />}
+                            对比
                           </button>
                         </div>
                       </div>
@@ -511,46 +550,21 @@ export default function ChatStudio() {
           )}
 
           {displayMessages.map((msg, i) => (
-            <div key={i} className={`max-w-3xl mx-auto flex gap-4 ${msg.role === 'user' ? 'justify-end' : ''}`}>
-              {msg.role !== 'user' && (
-                <div className={`w-8 h-8 rounded-xl flex items-center justify-center shrink-0 ${msg.role === 'agent' ? 'bg-indigo-50 text-indigo-500' : 'bg-gradient-to-tr from-indigo-500 to-sky-400 text-white'}`}>
-                  {msg.role === 'agent' ? <Zap size={14} /> : <Zap size={14} fill="white" />}
-                </div>
-              )}
-              <div className={`${msg.role === 'user' ? 'bg-black text-white px-5 py-3 rounded-2xl max-w-[85%] md:max-w-md' : 'space-y-1'}`}>
-                {msg.agentName && (
-                  <p className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest">{msg.agentName}</p>
-                )}
-                {msg.role === 'agent' ? (
-                  <p className="text-xs text-gray-400 italic">{msg.content}</p>
-                ) : msg.role === 'assistant' ? (
-                  <div className="text-sm text-gray-700 leading-relaxed whitespace-pre-wrap font-mono text-xs">{msg.content}</div>
-                ) : (
-                  <p className="text-sm">{msg.content}</p>
-                )}
-              </div>
-            </div>
+            <MessageItem key={i} msg={msg} />
           ))}
 
-          {/* Token-level streaming display */}
-          {streamingText && (
-            <div className="max-w-3xl mx-auto flex gap-4">
-              <div className="w-8 h-8 rounded-xl bg-indigo-50 flex items-center justify-center shrink-0">
-                <Loader2 size={14} className="text-indigo-500 animate-spin" />
+          {/* Stream status — 流式进行中的状态指示器 */}
+          {isStreaming && (
+            <div className="max-w-4xl mx-auto flex gap-6">
+              <div className="w-10 h-10 flex items-center justify-center shrink-0 border border-black/10 bg-[#F9F8F6] text-[#8C7A6B]">
+                <Loader2 size={14} className="animate-spin" />
               </div>
-              <div className="space-y-1">
-                <p className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest">streaming</p>
-                <p className="text-xs text-gray-400 italic font-mono whitespace-pre-wrap">{streamingText}</p>
+              <div className="w-full pt-1">
+                <p className="text-[10px] text-[#8C7A6B] uppercase tracking-[0.2em] flex items-center gap-2">
+                  <span className="w-1.5 h-1.5 bg-[#8C7A6B] animate-pulse" />
+                  Agent 输出中...
+                </p>
               </div>
-            </div>
-          )}
-
-          {isStreaming && !streamingText && (
-            <div className="max-w-3xl mx-auto flex gap-4">
-              <div className="w-8 h-8 rounded-xl bg-indigo-50 flex items-center justify-center shrink-0">
-                <Loader2 size={14} className="text-indigo-500 animate-spin" />
-              </div>
-              <p className="text-xs text-gray-400 italic">EVA 正在多源分析中...</p>
             </div>
           )}
 
@@ -559,25 +573,24 @@ export default function ChatStudio() {
             <div className="max-w-3xl mx-auto space-y-2">
               {/* Conflict alerts */}
               {hybrid.conflicts.length > 0 && (
-                <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 flex items-start gap-3">
-                  <AlertTriangle size={16} className="text-amber-500 shrink-0 mt-0.5" />
+                <div className="bg-[#F9F8F6] border border-[#D4C9BC] p-3 flex items-start gap-3">
+                  <AlertTriangle size={16} className="text-[#8C7A6B] shrink-0 mt-0.5" />
                   <div className="space-y-1">
-                    <p className="text-[10px] font-bold text-amber-700 uppercase tracking-widest">信息冲突</p>
+                    <p className="text-[10px] font-bold text-[#8C7A6B] uppercase tracking-[0.15em]">信息冲突</p>
                     {hybrid.conflicts.map((c, i) => (
-                      <p key={i} className="text-xs text-amber-600">{c}</p>
+                      <p key={i} className="text-xs text-[#3a3a3a]">{c}</p>
                     ))}
                   </div>
                 </div>
               )}
 
-              {/* Hallucination guard warnings */}
               {!hybrid.hallucinationPassed && (
-                <div className="bg-red-50 border border-red-200 rounded-xl p-3 flex items-start gap-3">
-                  <ShieldCheck size={16} className="text-red-500 shrink-0 mt-0.5" />
+                <div className="bg-[#F9F8F6] border border-[#D4C9BC] p-3 flex items-start gap-3">
+                  <ShieldCheck size={16} className="text-[#8C7A6B] shrink-0 mt-0.5" />
                   <div className="space-y-1">
-                    <p className="text-[10px] font-bold text-red-700 uppercase tracking-widest">可信度警告</p>
+                    <p className="text-[10px] font-bold text-[#8C7A6B] uppercase tracking-[0.15em]">可信度警告</p>
                     {hybrid.warnings.map((w, i) => (
-                      <p key={i} className="text-xs text-red-600">{w}</p>
+                      <p key={i} className="text-xs text-[#3a3a3a]">{w}</p>
                     ))}
                   </div>
                 </div>
@@ -594,11 +607,11 @@ export default function ChatStudio() {
                     reasoning: <Layers size={10} />,
                   };
                   const colors: Record<string, string> = {
-                    web: "bg-blue-50 text-blue-600 border-blue-100",
-                    rag: "bg-purple-50 text-purple-600 border-purple-100",
-                    memory: "bg-amber-50 text-amber-600 border-amber-100",
-                    tool: "bg-emerald-50 text-emerald-600 border-emerald-100",
-                    reasoning: "bg-gray-50 text-gray-500 border-gray-100",
+                    web: "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
+                    rag: "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
+                    memory: "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
+                    tool: "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
+                    reasoning: "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
                   };
                   return (
                     <span key={s.source} className={`px-2 py-0.5 rounded-full text-[9px] font-bold border flex items-center gap-1 ${colors[s.source] || colors.reasoning}`}>
@@ -608,12 +621,12 @@ export default function ChatStudio() {
                   );
                 })}
                 {hybrid.confidence > 0 && (
-                  <span className={`px-2 py-0.5 rounded-full text-[9px] font-bold border ${
+                  <span className={`px-2 py-0.5 text-[9px] font-bold border ${
                     hybrid.confidence >= 70
-                      ? "bg-green-50 text-green-600 border-green-100"
+                      ? "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]"
                       : hybrid.confidence >= 40
-                      ? "bg-amber-50 text-amber-600 border-amber-100"
-                      : "bg-red-50 text-red-600 border-red-100"
+                      ? "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]"
+                      : "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]"
                   }`}>
                     置信度 {hybrid.confidence.toFixed(0)}% {hybrid.confLevel && `(${hybrid.confLevel})`}
                   </span>
@@ -626,9 +639,8 @@ export default function ChatStudio() {
 
         {/* 底部输入框 */}
         <div className="p-4 md:p-8">
-          <div className="max-w-3xl mx-auto relative group">
-            <div className="absolute -inset-1 bg-gradient-to-r from-blue-100 to-indigo-100 rounded-[28px] blur-xl opacity-40 group-focus-within:opacity-100 transition-opacity" />
-            <div className="relative bg-white border border-black/[0.08] rounded-[24px] shadow-2xl p-2 flex items-end gap-2">
+          <div className="max-w-3xl mx-auto relative">
+            <div className="relative bg-white border border-black/10 p-2 flex items-end gap-2">
               <textarea
                 rows={1}
                 value={inputText}
@@ -640,12 +652,12 @@ export default function ChatStudio() {
               <button
                 onClick={() => handleSend()}
                 disabled={isStreaming || !inputText.trim()}
-                className="bg-black text-white p-4 rounded-[20px] hover:scale-105 active:scale-95 transition-all shadow-xl shadow-black/20 disabled:opacity-30"
+                className="bg-black text-white p-4 hover:bg-neutral-800 active:scale-95 transition-all disabled:opacity-30"
               >
                 <Send size={18} />
               </button>
             </div>
-            <div className="mt-4 flex justify-center gap-6 text-[10px] font-bold text-gray-300 uppercase tracking-widest">
+            <div className="mt-4 flex justify-center gap-6 text-[10px] font-bold text-[#8C7A6B] uppercase tracking-[0.15em]">
               <span>Smart Search</span>
               <span>Price Monitor</span>
               <span>Quality Audit</span>
@@ -657,34 +669,33 @@ export default function ChatStudio() {
       {/* 右侧情报面板 */}
       <aside className="w-[320px] border-l border-black/[0.04] bg-[#F9F9FB] overflow-y-auto hidden xl:block p-8">
         <div className="flex items-center justify-between mb-10">
-          <h3 className="text-xs font-bold uppercase tracking-widest text-black">EVA Intelligence</h3>
-          <span className="px-2 py-0.5 rounded bg-gradient-to-r from-indigo-500 to-purple-600 text-[9px] text-white">V7</span>
+          <h3 className="text-xs font-bold uppercase tracking-[0.2em] text-black">EVA Intelligence</h3>
+          <span className="px-2 py-0.5 border border-[#D4C9BC] bg-[#F9F8F6] text-[9px] text-[#8C7A6B]">V7</span>
         </div>
 
         <section className="space-y-6">
-          <div className="group relative bg-white border border-black/[0.04] rounded-3xl p-4 shadow-sm hover:shadow-xl transition-all duration-500 overflow-hidden">
+          <div className="group relative bg-white border border-black/[0.04] p-4 shadow-sm hover:shadow-lg transition-all duration-500 overflow-hidden">
             <div className="absolute top-0 right-0 p-3">
-              <ShieldCheck size={16} className="text-indigo-500" />
+              <ShieldCheck size={16} className="text-[#8C7A6B]" />
             </div>
-            {/* EVA Logo — Great Vibes */}
+            {/* EVA Logo — refined styling */}
             <div className="relative w-20 h-20 mb-4 flex items-center justify-center">
-              <div className="absolute inset-0 rounded-2xl bg-gradient-to-br from-indigo-500/20 via-purple-500/10 to-sky-400/20 blur-md group-hover:blur-xl group-hover:scale-150 transition-all duration-700" />
-              <div className="absolute inset-0 rounded-2xl bg-gradient-to-br from-indigo-600 to-purple-700 shadow-lg shadow-indigo-200 group-hover:shadow-indigo-300 group-hover:shadow-xl transition-all duration-500" />
-              <div className="absolute top-0 left-0 right-0 h-1/2 rounded-t-2xl bg-gradient-to-b from-white/25 to-transparent" />
-              <span className={`${greatVibes.className} relative text-4xl text-white drop-shadow-[0_2px_4px_rgba(0,0,0,0.3)] group-hover:scale-110 transition-transform duration-500`}>
+              <div className="absolute inset-0 bg-[#F9F8F6] shadow-sm group-hover:shadow-md transition-all duration-500" />
+              <div className="absolute top-0 left-0 right-0 h-1/2 bg-gradient-to-b from-white/50 to-transparent" />
+              <span className={`${greatVibes.className} relative text-4xl text-[#8C7A6B] group-hover:scale-110 transition-transform duration-500`}>
                 EV
               </span>
             </div>
             <h4 className="font-bold text-sm mb-1">EVA 工作流</h4>
-            <p className="text-xs text-gray-400 leading-relaxed">
+            <p className="text-xs text-[#3a3a3a] leading-relaxed font-light">
               Source Select → RAG + Web + Tool → Resolve → Guard → Report
             </p>
           </div>
 
           {/* ── Hybrid Source Status ── */}
           {hybrid.sources.length > 0 && (
-            <div className="p-4 bg-white rounded-3xl border border-black/[0.04] shadow-sm">
-              <h4 className="font-bold text-xs mb-3 uppercase tracking-widest">信息源状态</h4>
+            <div className="p-4 bg-white border border-black/[0.04] shadow-sm">
+              <h4 className="font-bold text-xs mb-3 uppercase tracking-[0.15em]">信息源状态</h4>
               <div className="space-y-2">
                 {hybrid.sources.map((s) => {
                   const icons: Record<string, React.ReactNode> = {
@@ -700,7 +711,7 @@ export default function ChatStudio() {
                         {icons[s.source] || <Layers size={12} />}
                         {s.label}
                       </span>
-                      <span className="w-1.5 h-1.5 rounded-full bg-green-400" />
+                      <span className="w-1.5 h-1.5 bg-[#8C7A6B]" />
                     </div>
                   );
                 })}
@@ -710,15 +721,15 @@ export default function ChatStudio() {
 
           {/* ── Confidence Breakdown ── */}
           {hybrid.confidence > 0 && (
-            <div className="p-4 bg-white rounded-3xl border border-black/[0.04] shadow-sm">
-              <h4 className="font-bold text-xs mb-3 uppercase tracking-widest">
+            <div className="p-4 bg-white border border-black/[0.04] shadow-sm">
+              <h4 className="font-bold text-xs mb-3 uppercase tracking-[0.15em]">
                 置信度评估
-                <span className={`ml-2 px-1.5 py-0.5 rounded text-[9px] ${
+                <span className={`ml-2 px-1.5 py-0.5 text-[9px] border ${
                   hybrid.confidence >= 70
-                    ? "bg-green-50 text-green-600"
+                    ? "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]"
                     : hybrid.confidence >= 40
-                    ? "bg-amber-50 text-amber-600"
-                    : "bg-red-50 text-red-600"
+                    ? "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]"
+                    : "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]"
                 }`}>
                   {hybrid.confidence.toFixed(0)}%
                 </span>
@@ -736,8 +747,8 @@ export default function ChatStudio() {
                       <div className="flex items-center gap-2">
                         <div className="w-16 h-1 bg-gray-100 rounded-full overflow-hidden">
                           <div
-                            className={`h-full rounded-full ${
-                              val >= 30 ? "bg-green-400" : val >= 15 ? "bg-amber-400" : "bg-red-400"
+                            className={`h-full ${
+                              val >= 30 ? "bg-[#8C7A6B]" : val >= 15 ? "bg-[#D4C9BC]" : "bg-[#D4C9BC]"
                             }`}
                             style={{ width: `${Math.min(val, 100)}%` }}
                           />
@@ -749,7 +760,7 @@ export default function ChatStudio() {
                 </div>
               )}
               {!hybrid.hallucinationPassed && (
-                <div className="mt-3 pt-3 border-t border-red-100 flex items-center gap-2 text-[10px] text-red-500">
+                <div className="mt-3 pt-3 border-t border-[#D4C9BC] flex items-center gap-2 text-[10px] text-[#8C7A6B]">
                   <AlertTriangle size={12} />
                   幻觉检查未通过
                 </div>
@@ -759,8 +770,8 @@ export default function ChatStudio() {
 
           {/* ── Perf timing ── */}
           {Object.keys(hybrid.perfTiming).length > 0 && (
-            <div className="p-4 bg-white rounded-3xl border border-black/[0.04] shadow-sm">
-              <h4 className="font-bold text-xs mb-3 uppercase tracking-widest">性能时序</h4>
+            <div className="p-4 bg-white border border-black/[0.04] shadow-sm">
+              <h4 className="font-bold text-xs mb-3 uppercase tracking-[0.15em]">性能时序</h4>
               <div className="space-y-1">
                 {Object.entries(hybrid.perfTiming).slice(0, 8).map(([key, val]) => (
                   <div key={key} className="flex items-center justify-between text-[10px]">
@@ -774,8 +785,8 @@ export default function ChatStudio() {
             </div>
           )}
 
-          <div className="p-4 bg-white rounded-3xl border border-black/[0.04] shadow-sm">
-            <h4 className="font-bold text-xs mb-3 uppercase tracking-widest">多源工具状态</h4>
+          <div className="p-4 bg-white border border-black/[0.04] shadow-sm">
+            <h4 className="font-bold text-xs mb-3 uppercase tracking-[0.15em]">多源工具状态</h4>
             {[
               { name: 'RAG 知识库', key: 'rag' },
               { name: 'Web 实时搜索', key: 'web' },
@@ -785,20 +796,20 @@ export default function ChatStudio() {
             ].map((tool) => (
               <div key={tool.key} className="flex items-center justify-between py-2 text-xs text-gray-500">
                 <span>{tool.name}</span>
-                <span className={`w-1.5 h-1.5 rounded-full ${
+                <span className={`w-1.5 h-1.5 ${
                   hybrid.sources.some(s => s.source === tool.key) || (tool.key === 'guard' && hybrid.hallucinationPassed)
-                    ? "bg-green-400"
+                    ? "bg-[#8C7A6B]"
                     : hybrid.sources.length > 0
-                    ? "bg-gray-300"
-                    : "bg-green-400"
+                    ? "bg-[#D4C9BC]"
+                    : "bg-[#8C7A6B]"
                 }`} />
               </div>
             ))}
           </div>
 
           {products.length > 0 && (
-            <div className="p-4 bg-white rounded-3xl border border-black/[0.04] shadow-sm">
-              <h4 className="font-bold text-xs mb-3 uppercase tracking-widest">当前商品</h4>
+            <div className="p-4 bg-white border border-black/[0.04] shadow-sm">
+              <h4 className="font-bold text-xs mb-3 uppercase tracking-[0.15em]">当前商品</h4>
               <div className="space-y-3">
                 {products.map((p) => (
                   <div key={p.id} className="flex items-center justify-between">
@@ -811,6 +822,55 @@ export default function ChatStudio() {
           )}
         </section>
       </aside>
+
+      {/* v10: 商品对比弹窗 */}
+      {showCompare && compareIds.size >= 2 && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={() => setShowCompare(false)}>
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="bg-white max-w-4xl w-full max-h-[90vh] overflow-y-auto p-6 shadow-2xl"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between mb-6">
+              <h3 className="text-sm font-bold uppercase tracking-[0.2em]">
+                商品对比 ({compareIds.size})
+              </h3>
+              <button onClick={() => { setShowCompare(false); setCompareIds(new Set()); }} className="p-1 hover:bg-black/5">
+                <X size={18} />
+              </button>
+            </div>
+            <div className={`grid gap-4 ${compareIds.size === 2 ? 'grid-cols-2' : 'grid-cols-3'}`}>
+              {products.filter(p => compareIds.has(p.id)).map(p => (
+                <div key={p.id} className="border border-black/[0.06] p-4">
+                  <div className="w-full aspect-square bg-[#F9F8F6] mb-3 flex items-center justify-center overflow-hidden">
+                    {p.image_url ? (
+                      <img src={p.image_url} alt={p.name} className="w-full h-full object-cover" />
+                    ) : (
+                      <span className="text-[10px] text-[#8C7A6B]">{p.platform}</span>
+                    )}
+                  </div>
+                  <h4 className="font-bold text-xs leading-snug mb-2">{p.name}</h4>
+                  <span className={`inline-block px-2 py-0.5 text-[9px] font-bold border mb-2 ${
+                    p.platform === "京东" ? "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]" : "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]"
+                  }`}>{p.platform}</span>
+                  <p className="text-xl font-black tracking-tight">{p.price ? `¥${p.price.toLocaleString()}` : '--'}</p>
+                  {p.original_price && p.price && p.original_price > p.price && (
+                    <p className="text-xs text-[#8C7A6B] line-through">¥{p.original_price.toLocaleString()}</p>
+                  )}
+                  {p.rating && <p className="text-[10px] text-[#8C7A6B] mt-1">⭐ {p.rating}{p.review_count ? ` (${p.review_count}评)` : ''}</p>}
+                  {p.url && (
+                    <a href={p.url} target="_blank" rel="noopener noreferrer"
+                       className="inline-block mt-3 text-[10px] font-bold text-[#8C7A6B] hover:text-black border-b border-[#D4C9BC]">
+                      查看商品 →
+                    </a>
+                  )}
+                </div>
+              ))}
+            </div>
+          </motion.div>
+        </div>
+      )}
     </div>
   );
 }

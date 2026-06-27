@@ -16,6 +16,7 @@ import json
 from typing import AsyncGenerator
 from app.agent.pipeline import run_pipeline
 from app.agent.intent_router import route_intent, is_shopping_intent, IntentType
+from app.agent.model_router import route_query
 from app.agent.llm_utils import llm_call
 from app.agent.progressive_context import ProgressiveContextBuilder, get_pre_search_prompt
 from app.core.llm import get_available_models, _verified_models
@@ -27,7 +28,7 @@ from app.core.verification_gate import VerificationGate, verify_response, safe_f
 from app.hybrid.guard import check_hallucination
 from app.config import get_settings
 
-FALLBACK_ORDER = ["deepseek", "openai", "glm47_flash", "glm_flash", "ernie_speed", "ernie35"]
+FALLBACK_ORDER = ["deepseek", "gemini_flash", "deepseek_flash", "gemini_pro", "openai", "glm47_flash", "glm_flash", "ernie_speed", "ernie35"]
 
 
 def get_active_fallback() -> str | None:
@@ -65,13 +66,17 @@ async def run_agent_stream(
     yield _sse({"type": "agent_progress", "agent": "intent_agent",
                 "message": f"意图分析: {intent_result.intent.value}"})
 
-    # ── 3. 构建摘要上下文 ──
-    context = _build_context(chat_history, user_query)
+    # ── 3. 构建 LLM 上下文（仅LLM用，搜索用纯净 user_query）──
+    # v10: 保留完整的 messages 数组结构，LLM 可区分用户/助手角色
+    llm_context: list[dict] = _build_context(chat_history, user_query)
 
-    # ── 4. 非购物意图 → 轻量 LLM 调用（保持原逻辑）──
+    # ── 4. 非购物意图 → 轻量 LLM 调用 ──
     if not is_shopping_intent(intent_result):
         result = await run_pipeline(
-            user_query=context, user_id=user_id, bypass_cache=False,
+            user_query=user_query,
+            user_id=user_id,
+            bypass_cache=False,
+            chat_history=llm_context,
         )
         yield _sse({"type": "agent_progress", "agent": "analysis_pipeline", "message": "综合分析"})
         if result.get("final_report"):
@@ -87,42 +92,173 @@ async def run_agent_stream(
         yield _sse({"type": "done"})
         return
 
-    # ── 5. 购物意图 — v8 LLM抢占模式 ──
+    # ── 5. 购物意图 — v2.0 Single LLM Fusion ──
+    # v2.0优化: 移除抢占式LLM（可能无响应导致沉默），改用本地状态 + 搜索完成后单次LLM
     token_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=queue_size)
     ctx_builder = ProgressiveContextBuilder(user_query, intent_result.intent.value)
 
     async def token_callback(text: str):
         await token_queue.put(text)
 
-    # 5a. 立即启动 LLM 流 (抢占式 — 不等搜索)
-    pre_sys, pre_msg = get_pre_search_prompt(user_query, intent_result.intent.value)
-    llm_task = asyncio.create_task(
-        llm_call(
-            system_prompt=pre_sys,
-            user_message=pre_msg,
-            max_tokens=150,  # 初始响应短一些
-            temperature=0.4,
-            user_id=user_id,
-            node_name="pre_search",
-            stream_callback=token_callback,
-        )
-    )
+    # 5a. 立即发送搜索状态（本地生成，不依赖LLM可用性）
+    from app.agent.category_mapper import map_category
+    cat = map_category(user_query)
+    cat_info = f"「{cat.subcategory}」" if cat.is_valid else ""
+    yield _sse({"type": "token", "text": f"正在搜索{cat_info}...", "node": "status"})
 
-    # 5b. Pipeline 并行搜索（与 LLM 同时跑）
+    # 5a.5 v10: LLM Tool Planning — 让 LLM 决定调用哪些工具（Function Calling）
+    # 仅对购物意图启用，非购物走轻量路径
+    tool_results_used = False
+    try:
+        intent_cfg = route_query(user_query, intent_result.intent.value)
+        # 仅对复杂/购物类查询启用工具调用
+        if intent_result.intent.value in (
+            "buy_product", "compare_products", "recommend_products",
+            "price_check", "trend_analysis", "shopping",
+        ):
+            from app.tools.registry import registry
+            from app.tools.executor import executor as tool_executor
+            from app.agent.llm_utils import llm_call_with_tools
+            from app.agent.eva_system_prompt import get_gateway_prompt
+
+            tool_schemas = registry.get_openai_schemas(role="free")
+            planning_prompt = get_gateway_prompt(intent_result.intent.value)
+            planning_msg = (
+                f"用户查询: {user_query}\n\n"
+                f"意图: {intent_result.intent.value}\n"
+                f"请判断需要调用哪些工具来获取数据。不需要工具就直接回复'无需工具'。"
+            )
+
+            tool_calls, tool_provider, tool_ms = await llm_call_with_tools(
+                system_prompt=planning_prompt,
+                user_message=planning_msg,
+                tools=tool_schemas,
+                max_tokens=300,
+                temperature=0.2,
+                user_id=user_id,
+                node_name="tool_planning",
+                tool_choice="auto",
+            )
+
+            if tool_calls:
+                yield _sse({"type": "agent_progress", "agent": "tool_planner",
+                           "message": f"AI 决定调用 {len(tool_calls)} 个工具 ({tool_provider}, {tool_ms:.0f}ms)"})
+
+                tool_call_dicts = []
+                for tc in tool_calls:
+                    tc_dict = {
+                        "name": tc.get("function", {}).get("name", tc.get("name", "")),
+                        "arguments": tc.get("function", {}).get("arguments", tc.get("arguments", {})),
+                    }
+                    if isinstance(tc_dict["arguments"], str):
+                        try:
+                            import json as _json
+                            tc_dict["arguments"] = _json.loads(tc_dict["arguments"])
+                        except Exception:
+                            tc_dict["arguments"] = {}
+                    tool_call_dicts.append(tc_dict)
+                    yield _sse({"type": "agent_progress", "agent": "tool_call",
+                               "message": f"调用工具: {tc_dict['name']}"})
+
+                tool_results = await tool_executor.execute_llm_tool_calls(tool_call_dicts)
+                if tool_results:
+                    results_list = [
+                        {"tool": call_id, "result": tr.to_dict() if hasattr(tr, 'to_dict') else str(tr)}
+                        for call_id, tr in tool_results.items()
+                    ]
+                    await ctx_builder.add_tool_results(results_list)
+                    tool_results_used = True
+                    for call_id, tr in tool_results.items():
+                        data = tr.to_dict() if hasattr(tr, 'to_dict') else {"data": str(tr)}
+                        yield _sse({"type": "agent_progress", "agent": "tool_result",
+                                   "message": f"工具 {call_id} 完成",
+                                   "tool": call_id, "data": data})
+
+                    # ── v10 ReAct Loop: think → act → observe ──
+                    # 最多循环 3 步，防止无限推理
+                    react_steps = 0
+                    max_react_steps = 3
+                    while react_steps < max_react_steps:
+                        react_steps += 1
+                        # 构建观察结果上下文
+                        obs_context = "工具执行结果:\n"
+                        for call_id, tr in tool_results.items():
+                            obs_context += f"[{call_id}]: {tr.to_dict() if hasattr(tr, 'to_dict') else str(tr)[:300]}\n"
+                        obs_context += f"\n用户原始查询: {user_query}\n"
+                        obs_context += "请判断: 是否需要继续调用更多工具？如果需要，请调用工具；如果不需要，请回复'完成'。"
+
+                        react_calls, react_provider, react_ms = await llm_call_with_tools(
+                            system_prompt=planning_prompt,
+                            user_message=obs_context,
+                            tools=tool_schemas,
+                            max_tokens=300,
+                            temperature=0.2,
+                            user_id=user_id,
+                            node_name=f"react_step{react_steps}",
+                            tool_choice="auto",
+                        )
+
+                        if not react_calls:
+                            yield _sse({"type": "agent_progress", "agent": "react",
+                                       "message": f"ReAct 步骤{react_steps}: 推理完成"})
+                            break
+
+                        # 执行新工具
+                        react_call_dicts = []
+                        for tc in react_calls:
+                            tc_dict = {
+                                "name": tc.get("function", {}).get("name", tc.get("name", "")),
+                                "arguments": tc.get("function", {}).get("arguments", tc.get("arguments", {})),
+                            }
+                            if isinstance(tc_dict["arguments"], str):
+                                try:
+                                    import json as _json
+                                    tc_dict["arguments"] = _json.loads(tc_dict["arguments"])
+                                except Exception:
+                                    tc_dict["arguments"] = {}
+                            react_call_dicts.append(tc_dict)
+                            yield _sse({"type": "agent_progress", "agent": "react",
+                                       "message": f"ReAct 步骤{react_steps}: 调用 {tc_dict['name']}",
+                                       "step": react_steps})
+
+                        react_results = await tool_executor.execute_llm_tool_calls(react_call_dicts)
+                        if react_results:
+                            results_list = [
+                                {"tool": cid, "result": tr.to_dict() if hasattr(tr, 'to_dict') else str(tr)}
+                                for cid, tr in react_results.items()
+                            ]
+                            await ctx_builder.add_tool_results(results_list)
+                            tool_results = react_results  # 下一轮观察
+                        else:
+                            break
+            else:
+                yield _sse({"type": "agent_progress", "agent": "tool_planner",
+                           "message": "AI 判断无需额外工具调用，直接搜索"})
+    except Exception as e:
+        # 工具规划失败不阻塞主流程
+        append_log("WARN", f"Tool planning skipped: {type(e).__name__}: {str(e)[:80]}")
+
+    # 5b. Pipeline 搜索（唯一任务 — 不再并行LLM）
     pipeline_task = asyncio.create_task(
-        run_pipeline(user_query=context, user_id=user_id, stream_callback=None)
+        run_pipeline(user_query=user_query, user_id=user_id,
+                     stream_callback=token_callback, chat_history=llm_context)
     )
 
-    # 5c. 主循环 — 双任务同时运行时的 token 排水
-    while not llm_task.done() or not pipeline_task.done():
+    # 5c. 等待 + 心跳
+    last_heartbeat = asyncio.get_event_loop().time()
+    while not pipeline_task.done():
+        # Drain any tokens from pipeline LLM
         try:
-            text = await asyncio.wait_for(token_queue.get(), timeout=token_poll_ms)
+            text = await asyncio.wait_for(token_queue.get(), timeout=0.5)
             yield _sse({"type": "token", "text": text, "node": "search_review"})
+            last_heartbeat = asyncio.get_event_loop().time()
         except asyncio.TimeoutError:
-            # 轮询间隔 — 检查是否有 token 到达
-            pass
+            now = asyncio.get_event_loop().time()
+            if now - last_heartbeat > 2.0:
+                yield _sse({"type": "token", "text": "⏳ 搜索进行中...", "node": "heartbeat"})
+                last_heartbeat = now
 
-    # 排空残余 token
+    # Drain remaining tokens
     while not token_queue.empty():
         text = token_queue.get_nowait()
         yield _sse({"type": "token", "text": text, "node": "search_review"})
@@ -210,20 +346,90 @@ async def run_agent_stream(
 
     yield _sse({"type": "agent_progress", "agent": "analysis_pipeline", "message": "综合分析"})
 
-    # ── 8. 先发射 final_report（不等待验证）──
+    # ── 8. v10: Synchronous Verification Gate — 先验证，再发射 final_report ──
     final_report = result.get("final_report", "")
-    if final_report:
-        yield _sse({"type": "final_report", "markdown": final_report})
+    verification_passed = True
+    verification_warnings: list[str] = []
+    verification_action = "allow"
 
-    # ── 9. Trust 元数据（先发射基础版）──
-    yield _sse({"type": "trust", "confidence": result.get("confidence", 0),
-                "data_source": result.get("data_source", "unknown"),
-                "citation": result.get("citation", ""),
-                "warning": result.get("confidence_warning"),
-                "search_layers": result.get("search_layers", []),
-                "total_products": result.get("total_products_found", 0),
-                "verification_passed": True,   # 先乐观通过
-                "verification_warnings": []})
+    if final_report:
+        # 准备证据
+        evidence_list: list = []
+        from app.hybrid.types import SourceEvidence, SourceType as HybridSourceType
+        rag_docs = result.get("rag_docs", [])
+        if rag_docs:
+            for doc in rag_docs[:5]:
+                evidence_list.append(SourceEvidence(
+                    source=HybridSourceType.RAG,
+                    content=doc.get("content", "")[:500] if isinstance(doc, dict) else str(doc)[:500],
+                    url=doc.get("source", "") if isinstance(doc, dict) else "",
+                    relevance_score=doc.get("confidence", 0.5) if isinstance(doc, dict) else 0.5,
+                ))
+        if products:
+            for p in products[:8]:
+                p_name = p.get("name", p.get("title", ""))
+                p_price = p.get("price", "")
+                p_platform = p.get("platform", "")
+                content = f"{p_name} | 平台:{p_platform} | 价格:{p_price}"
+                evidence_list.append(SourceEvidence(
+                    source=HybridSourceType.WEB,
+                    content=content,
+                    url=p.get("url", ""),
+                    relevance_score=p.get("confidence", 0.5),
+                ))
+
+        # 执行同步验证（~10-50ms，纯规则引擎，无 LLM 调用）
+        try:
+            from app.core.verification_gate import VerificationGate
+            gate = VerificationGate(threshold=50.0)
+            verdict = await gate.verify(final_report, evidence_list, products)
+            verification_passed = verdict.passed
+            verification_warnings = verdict.warnings
+            verification_action = verdict.action
+
+            # 发射验证结果事件
+            yield _sse({"type": "verification",
+                        "action": verdict.action,
+                        "passed": verdict.passed,
+                        "confidence": verdict.overall_confidence,
+                        "checks": len(verdict.checks),
+                        "failed_checks": verdict.failed_checks,
+                        "warnings": verdict.warnings})
+        except Exception as e:
+            append_log("WARN", f"验证门执行异常: {str(e)[:100]}")
+            # 验证失败不影响输出 — fall through with warnings
+
+        # ── 根据验证结果决定输出 ──
+        if verification_action == "block":
+            from app.core.verification_gate import SAFE_FALLBACK_MESSAGE
+            yield _sse({"type": "final_report", "markdown": SAFE_FALLBACK_MESSAGE})
+        else:
+            if verification_action == "flag":
+                # 追加警告标记
+                flagged_report = final_report
+                if verification_warnings:
+                    flagged_report += "\n\n> ⚠️ **数据可信度警告**：以下声明未经充分验证，请谨慎参考。\n"
+                    for w in verification_warnings[:3]:
+                        flagged_report += f"> - {w}\n"
+                yield _sse({"type": "final_report", "markdown": flagged_report})
+            else:
+                yield _sse({"type": "final_report", "markdown": final_report})
+
+    # ── 9. Trust 元数据（含实际验证结果）──
+    trust_data = {
+        "type": "trust",
+        "confidence": result.get("confidence", 0),
+        "data_source": result.get("data_source", "unknown"),
+        "citation": result.get("citation", ""),
+        "warning": result.get("confidence_warning"),
+        "freshness_warning": result.get("data_freshness_warning"),
+        "data_cached_at": result.get("data_cached_at"),
+        "search_layers": result.get("search_layers", []),
+        "total_products": result.get("total_products_found", 0),
+        "verification_passed": verification_passed,
+        "verification_warnings": verification_warnings,
+    }
+    yield _sse(trust_data)
 
     # ── 10. Perf timing ──
     if result.get("perf"):
@@ -231,126 +437,29 @@ async def run_agent_stream(
 
     yield _sse({"type": "done"})
 
-    # ── 11. 异步 Verification（后台执行，不阻塞用户响应）──
-    if final_report and products:
-        asyncio.create_task(
-            _async_verify_and_emit(final_report, products, result, token_queue)
-        )
-
 
 def _sse(data: dict) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-async def _async_verify_and_emit(
-    final_report: str,
-    products: list[dict],
-    result: dict,
-    token_queue: asyncio.Queue,
-):
-    """后台异步验证 + 通过 token_queue 回传结果。
+def _build_context(chat_history: list[dict] | None, current_query: str) -> list[dict]:
+    """v10: Return properly structured messages array for multi-turn LLM context.
 
-    关键原则：不阻塞主响应流。验证在后台进行，
-    结果通过独立 SSE 事件发送给前端。
-    """
-    try:
-        from app.hybrid.types import SourceEvidence
+    Returns a list of {"role": str, "content": str} dicts suitable for direct
+    injection into the LLM messages array.  Maintains role segregation so the
+    LLM can distinguish user vs assistant turns.
 
-        evidence_list: list = []
-        rag_docs = result.get("rag_docs", [])
-        if rag_docs:
-            for doc in rag_docs[:5]:
-                evidence_list.append(SourceEvidence(
-                    source=SourceType.RAG,
-                    content=doc.get("content", "")[:500],
-                    relevance_score=doc.get("score", 0.5),
-                    authority="rag",
-                ))
-
-        if products:
-            product_text = "\n".join(
-                f"{p.get('name','?')} | {p.get('platform','?')} | "
-                f"¥{p.get('price',0)} | source={p.get('source','?')}"
-                for p in products[:5]
-            )
-            evidence_list.append(SourceEvidence(
-                source=SourceType.TOOL,
-                content=product_text,
-                relevance_score=0.8,
-                authority="product_db",
-            ))
-
-        gate = VerificationGate(threshold=50.0)
-        verdict = await gate.verify(final_report, evidence_list, products)
-
-        verification_event = json.dumps({
-            "type": "verification",
-            "passed": verdict.passed,
-            "action": verdict.action.value,
-            "confidence": verdict.overall_confidence,
-            "failed_checks": verdict.failed_checks,
-            "warnings": verdict.warnings,
-        }, ensure_ascii=False)
-
-        await token_queue.put(f"data: {verification_event}\n\n")
-
-        if not verdict.passed:
-            append_log("WARN",
-                f"Verification BLOCKED (async): {verdict.failed_checks} "
-                f"confidence={verdict.overall_confidence:.0f}%")
-    except Exception as e:
-        append_log("ERROR", f"Async verification failed: {str(e)[:100]}")
-
-
-def _build_context(chat_history: list[dict] | None, current_query: str) -> str:
-    """Build summarized context from chat history.
-
-    Strategy: keep last 5 messages verbatim, summarize older messages.
-    This keeps context small while preserving recent conversation flow.
+    Truncation is handled upstream (chat.py keeps last N messages via config).
     """
     if not chat_history:
-        return current_query
+        return []
 
-    if len(chat_history) <= 6:
-        # Small history — just include directly
-        lines = []
-        for m in chat_history[-6:]:
-            role = "用户" if m.get("role") == "user" else "助手"
-            content = (m.get("content") or "")[:80]
-            if content.strip():
-                lines.append(f"{role}: {content}")
-        if lines:
-            lines.append(f"用户: {current_query}")
-            return "\n".join(lines)
-        return current_query
-
-    # Longer history — summarize older messages
-    recent = chat_history[-5:]
-    older = chat_history[:-5]
-
-    # Simple extractive summary: key topics from older messages
-    topics = set()
-    for m in older:
-        content = (m.get("content") or "")[:50]
-        if "价格" in content or "price" in content.lower():
-            topics.add("曾讨论价格")
-        elif "推荐" in content or "recommend" in content.lower():
-            topics.add("曾请求推荐")
-        elif "对比" in content or "vs" in content.lower():
-            topics.add("曾进行对比")
-
-    lines = []
-    if topics:
-        lines.append(f"[历史摘要: {'; '.join(topics)}]")
-
-    for m in recent:
-        role = "用户" if m.get("role") == "user" else "助手"
-        content = (m.get("content") or "")[:100]
-        if content.strip():
-            lines.append(f"{role}: {content}")
-
-    lines.append(f"用户: {current_query}")
-    return "\n".join(lines)
+    # Return properly typed messages — no flattening, no truncation here
+    return [
+        {"role": m.get("role", "user"), "content": m.get("content", "")}
+        for m in chat_history
+        if m.get("content", "").strip()
+    ]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -384,7 +493,19 @@ async def run_hybrid_agent_stream(
                 "message": f"意图分析: {intent_result.intent.value}"})
 
     # ── 3. Build context ──
-    context = _build_context(chat_history, user_query)
+    # v10: 保留完整的 messages 数组结构
+    llm_context: list[dict] = _build_context(chat_history, user_query)
+
+    # ── 3.5. Initial status token → 前端立即看到搜索状态 ──
+    try:
+        from app.agent.category_mapper import map_category as _map_cat
+        _cat = _map_cat(user_query)
+        _cat_info = f"「{_cat.subcategory}」" if _cat.is_valid else ""
+        yield _sse({"type": "token", "text": f"正在多源搜索{_cat_info}...", "node": "status"})
+    except Exception as _e:
+        import sys
+        print(f"[HYBRID DEBUG] Initial token failed: {_e}", file=sys.stderr)
+        yield _sse({"type": "token", "text": "正在多源搜索...", "node": "status"})
 
     # ── 4. Launch v6 pipeline + HybridAI in parallel ──
     #    v6 pipeline runs the 7-layer product search
@@ -398,7 +519,7 @@ async def run_hybrid_agent_stream(
     # HybridAI task (Web + Memory + Tool + source selection)
     hybrid_task = asyncio.create_task(
         hybrid_ai.process(
-            user_query=context,
+            user_query=user_query,
             user_id=user_id,
             chat_history=chat_history,
             existing_products=None,  # Will be filled after pipeline completes
@@ -409,31 +530,53 @@ async def run_hybrid_agent_stream(
 
     # v6 Pipeline task
     pipeline_task = asyncio.create_task(
-        run_pipeline(user_query=context, user_id=user_id, stream_callback=token_callback)
+        run_pipeline(user_query=user_query, user_id=user_id,
+                     stream_callback=token_callback, chat_history=llm_context)
     )
 
-    # ── 5. Drain tokens while pipeline + hybrid run ──
-    while not pipeline_task.done() and not hybrid_task.done():
+    # ── 5. Streaming drain loop — heartbeat + pipeline-first emission ──
+    #   核心原则：pipeline 产生数据就立即发射，不等待 hybrid_task
+    last_heartbeat = asyncio.get_event_loop().time()
+    pipeline_emitted = False  # 防止 pipeline 结果重复发射
+
+    # 预声明变量，避免在循环内声明导致作用域问题
+    result: dict = {}
+    products: list[dict] = []
+    search_layers: list[str] = []
+    data_source = "unknown"
+    v6_confidence = 0.0
+
+    while not pipeline_task.done() or not hybrid_task.done():
+        # ── Drain LLM tokens ──
         try:
-            text = await asyncio.wait_for(token_queue.get(), timeout=0.08)
+            text = await asyncio.wait_for(token_queue.get(), timeout=0.5)
             yield _sse({"type": "token", "text": text, "node": "search_review"})
+            last_heartbeat = asyncio.get_event_loop().time()
         except asyncio.TimeoutError:
-            pass
+            # ── Heartbeat: 每 2s 告诉前端"我还活着" ──
+            now = asyncio.get_event_loop().time()
+            if now - last_heartbeat > 2.0:
+                if pipeline_task.done() and not hybrid_task.done():
+                    yield _sse({"type": "token", "text": "⏳ 多源情报分析中...", "node": "heartbeat"})
+                elif not pipeline_task.done():
+                    yield _sse({"type": "token", "text": "⏳ 搜索进行中...", "node": "heartbeat"})
+                last_heartbeat = now
 
-    # Drain remaining tokens
-    while not token_queue.empty():
-        text = token_queue.get_nowait()
-        yield _sse({"type": "token", "text": text, "node": "search_review"})
+        # ── Pipeline 先完成 → 立即发射结果，不等待 hybrid ──
+        if pipeline_task.done() and not pipeline_emitted:
+            pipeline_emitted = True
+            # Drain remaining LLM tokens before emitting results
+            while not token_queue.empty():
+                text = token_queue.get_nowait()
+                yield _sse({"type": "token", "text": text, "node": "search_review"})
 
-    # ── 6. Get pipeline result ──
-    try:
-        result = pipeline_task.result()
-    except Exception as e:
-        append_log("ERROR", f"Hybrid AI pipeline异常: {str(e)[:100]}")
-        fallback = get_active_fallback()
-        hint = f" 系统已自动切换至 {fallback} 模型，请重试。" if fallback else ""
-        # Emit a proper final_report so the frontend shows something useful
-        error_report = f"""## ⚠️ 服务暂时不可用
+            try:
+                result = pipeline_task.result()
+            except Exception as e:
+                append_log("ERROR", f"Hybrid AI pipeline异常: {str(e)[:100]}")
+                fallback = get_active_fallback()
+                hint = f" 系统已自动切换至 {fallback} 模型，请重试。" if fallback else ""
+                error_report = f"""## ⚠️ 服务暂时不可用
 
 **原因：** AI 模型服务暂时无响应（{str(e)[:80]}）
 
@@ -444,22 +587,85 @@ async def run_hybrid_agent_stream(
 
 ---
 *EVA 系统会持续监控模型可用性，并在恢复后立即通知。*"""
-        yield _sse({"type": "final_report", "markdown": error_report})
-        yield _sse({"type": "error", "message": str(e)[:100] + hint})
-        yield _sse({"type": "done"})
-        return
+                yield _sse({"type": "final_report", "markdown": error_report})
+                yield _sse({"type": "error", "message": str(e)[:100] + hint})
+                yield _sse({"type": "done"})
+                return
 
-    products = result.get("search_results", [])
-    search_layers = result.get("search_layers", [])
-    data_source = result.get("data_source", "unknown")
-    v6_confidence = result.get("confidence", 0)
+            products = result.get("search_results", [])
+            search_layers = result.get("search_layers", [])
+            data_source = result.get("data_source", "unknown")
+            v6_confidence = result.get("confidence", 0)
 
-    # ── 7. Get HybridAI result ──
+            # ── Emit products immediately ──
+            if products:
+                layer_names = {
+                    "hot_products": "热门商品库",
+                    "trending_normalize": "热门搜索匹配",
+                    "rag": "RAG知识库",
+                    "product_cache": "商品缓存库",
+                    "live_search": "电商平台实时搜索",
+                    "similar_search": "相似商品匹配",
+                    "template": "模板匹配",
+                    "link_fallback": "链接回退",
+                }
+                for layer in search_layers:
+                    label = layer_names.get(layer, layer)
+                    yield _sse({"type": "agent_progress", "agent": "search_layer",
+                               "message": f"搜索层: {label}", "layer": layer})
+
+                simulated_count = sum(1 for p in products if p.get("source") == "simulated")
+                real_count = len(products) - simulated_count
+                msg = f"找到 {len(products)} 个商品"
+                if simulated_count > 0:
+                    msg += f"（{real_count}个真实数据，{simulated_count}个模拟数据）"
+                yield _sse({"type": "agent_progress", "agent": "search_agent", "message": msg})
+                yield _sse({"type": "agent_result", "agent": "search_agent",
+                           "products": products, "data_source": data_source,
+                           "search_layers": search_layers})
+
+            # ── Emit final_report immediately (pipeline version, 不等 hybrid) ──
+            v6_report = result.get("final_report", "")
+            if v6_report:
+                yield _sse({"type": "final_report", "markdown": v6_report})
+            elif not products:
+                yield _sse({"type": "final_report",
+                            "markdown": format_insufficient_data()})
+
+    # Drain remaining tokens
+    while not token_queue.empty():
+        text = token_queue.get_nowait()
+        yield _sse({"type": "token", "text": text, "node": "search_review"})
+
+    # ── 6. Ensure pipeline results (race-condition guard: if loop exited on hybrid) ──
+    if not pipeline_emitted:
+        try:
+            result = pipeline_task.result()
+        except Exception as e:
+            append_log("ERROR", f"Hybrid AI pipeline异常 (late): {str(e)[:100]}")
+            fallback = get_active_fallback()
+            hint = f" 系统已自动切换至 {fallback} 模型，请重试。" if fallback else ""
+            yield _sse({"type": "final_report", "markdown": f"## ⚠️ 服务暂时不可用\n\n{str(e)[:80]}{hint}"})
+            yield _sse({"type": "error", "message": str(e)[:100] + hint})
+            yield _sse({"type": "done"})
+            return
+        products = result.get("search_results", [])
+        search_layers = result.get("search_layers", [])
+        data_source = result.get("data_source", "unknown")
+        v6_confidence = result.get("confidence", 0)
+        if products:
+            yield _sse({"type": "agent_result", "agent": "search_agent",
+                       "products": products, "data_source": data_source,
+                       "search_layers": search_layers})
+        v6_report = result.get("final_report", "")
+        if v6_report:
+            yield _sse({"type": "final_report", "markdown": v6_report})
+
+    # ── 7. Get HybridAI result (supplementary — 不阻塞主报告) ──
     try:
         hybrid_result = await hybrid_task
     except Exception as e:
         append_log("WARN", f"HybridAI engine failed: {str(e)[:80]}, falling back to v6 only")
-        # Build a minimal HybridResult from v6 data
         from app.hybrid.types import HybridResult, SourceType as ST, ConfidenceLevel as CL
         hybrid_result = HybridResult(
             answer=result.get("final_report", ""),
@@ -470,88 +676,35 @@ async def run_hybrid_agent_stream(
             warnings=["HybridAI引擎暂时不可用，仅使用v6管线结果。"],
         )
 
-    # ── 8. Emit hybrid source info ──
+    # ── 8. Emit hybrid supplementary events (metadata only, final_report already sent) ──
     yield _sse({"type": "hybrid_sources", "sources": [
         {"source": s.value, "label": _source_label(s)}
         for s in hybrid_result.sources_used
     ]})
 
-    # ── 9. Emit products (from v6 pipeline) ──
-    if products:
-        layer_names = {
-            "hot_products": "热门商品库",
-            "trending_normalize": "热门搜索匹配",
-            "rag": "RAG知识库",
-            "product_cache": "商品缓存库",
-            "live_search": "电商平台实时搜索",
-            "similar_search": "相似商品匹配",
-            "template": "模板匹配",
-            "link_fallback": "链接回退",
-        }
-        for layer in search_layers:
-            label = layer_names.get(layer, layer)
-            yield _sse({"type": "agent_progress", "agent": "search_layer",
-                       "message": f"搜索层: {label}", "layer": layer})
-
-        simulated_count = sum(1 for p in products if p.get("source") == "simulated")
-        real_count = len(products) - simulated_count
-        msg = f"找到 {len(products)} 个商品"
-        if simulated_count > 0:
-            msg += f"（{real_count}个真实数据，{simulated_count}个模拟数据）"
-
-        yield _sse({"type": "agent_progress", "agent": "search_agent", "message": msg})
-        yield _sse({"type": "agent_result", "agent": "search_agent",
-                   "products": products, "data_source": data_source,
-                   "search_layers": search_layers})
-
-    # ── 10. Emit hybrid confidence ──
     yield _sse({"type": "hybrid_confidence",
                 "confidence": hybrid_result.confidence,
                 "level": hybrid_result.confidence_level.value,
                 "breakdown": hybrid_result.confidence_breakdown})
 
-    # ── 11. Emit conflicts (if any) ──
     if hybrid_result.conflicts_detected:
         yield _sse({"type": "hybrid_conflict",
                     "conflicts": hybrid_result.conflict_details})
 
-    # ── 12. Emit hallucination guard result ──
     if not hybrid_result.hallucination_checks_passed:
         yield _sse({"type": "hybrid_guard",
                     "passed": False,
                     "warnings": hybrid_result.warnings})
 
-    # ── 13. Build final report with hybrid formatting ──
-    v6_report = result.get("final_report", "")
-    if v6_report:
-        # Use v6 report as base, enrich with hybrid metadata
-        hybrid_answer = v6_report
-
-        # Append hybrid source info if web/memory/tool were used
-        non_rag_sources = [
-            s for s in hybrid_result.sources_used
-            if s not in (SourceType.RAG, SourceType.REASONING)
-        ]
-        if non_rag_sources:
-            source_note = "\n\n---\n\n**【补充信息源】**\n"
-            for s in non_rag_sources:
-                source_note += f"- {_source_label(s)}\n"
-            hybrid_answer += source_note
-
-        yield _sse({"type": "final_report", "markdown": hybrid_answer})
-    elif hybrid_result.answer:
-        yield _sse({"type": "final_report", "markdown": hybrid_result.answer})
-    else:
-        yield _sse({"type": "final_report",
-                    "markdown": format_insufficient_data()})
-
-    # ── 14. Enhanced trust metadata (v7) ──
+    # ── 9. Enhanced trust metadata (enriched with hybrid data) ──
     yield _sse({"type": "trust",
                 "confidence": hybrid_result.confidence,
                 "confidence_level": hybrid_result.confidence_level.value,
                 "data_source": data_source,
                 "citation": result.get("citation", ""),
                 "warning": result.get("confidence_warning"),
+                "freshness_warning": result.get("data_freshness_warning"),
+                "data_cached_at": result.get("data_cached_at"),
                 "search_layers": search_layers,
                 "total_products": len(products),
                 "hybrid_sources": [s.value for s in hybrid_result.sources_used],
@@ -559,7 +712,7 @@ async def run_hybrid_agent_stream(
                 "conflicts": hybrid_result.conflict_details if hybrid_result.conflicts_detected else [],
                 })
 
-    # ── 15. Perf timing ──
+    # ── 10. Perf timing ──
     if result.get("perf"):
         yield _sse({"type": "perf", "timing": result["perf"],
                     "hybrid_latency_ms": hybrid_result.total_latency_ms})

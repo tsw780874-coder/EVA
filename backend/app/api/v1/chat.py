@@ -1,12 +1,13 @@
 import asyncio
+import hashlib
 import json
 import uuid
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, insert
-from app.api.deps import get_db, require_user
+from app.api.deps import get_db, require_user, check_quota, check_rate_limit
 from app.models.user import User
 from app.models.chat import ChatSession, ChatMessage
 from app.models.report import Report
@@ -103,8 +104,17 @@ async def stream_chat(
     session_id: str,
     body: SendMessageRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_user),
+    current_user: User = Depends(check_quota),
 ):
+    # --- Rate limit check ---
+    await check_rate_limit(current_user)
+
+    # --- Content safety check ---
+    from app.core.content_filter import filter_content
+    safety_result = filter_content(body.content)
+    if not safety_result.passed:
+        raise HTTPException(status_code=400, detail=safety_result.reason)
+
     # --- Single query: validate session + get history ---
     from sqlalchemy.orm import selectinload
     q = (
@@ -134,6 +144,7 @@ async def stream_chat(
     async def event_stream():
         full_reply = ""
         perf_timing: dict = {}
+        captured_products: list[dict] = []
         try:
             async for chunk in run_agent_stream(body.content, chat_history, current_user.id):
                 # Extract final_report for persistence
@@ -145,6 +156,17 @@ async def stream_chat(
                         text = data.get("markdown", "")
                         if text:
                             full_reply = text
+                    except Exception:
+                        pass
+                # Capture products from agent_result
+                if "agent_result" in chunk:
+                    try:
+                        prefix = "data: "
+                        data_str = chunk[len(prefix):] if chunk.startswith(prefix) else chunk
+                        data = json.loads(data_str)
+                        prods = data.get("products", [])
+                        if prods:
+                            captured_products = prods
                     except Exception:
                         pass
                 # Capture perf timing
@@ -159,13 +181,28 @@ async def stream_chat(
                 yield chunk
 
             # Background persistence — don't block stream close
-            reply_content = full_reply or "分析完成，报告已生成"
+            if not full_reply:
+                append_log("WARN", f"Agent 返回空内容 — 所有 LLM provider 可能均已失败")
+                full_reply = (
+                    "⚠️ **AI 模型暂时不可用**\n\n"
+                    "很抱歉，当前所有 AI 模型服务均未能返回有效响应。\n\n"
+                    "**可能的原因：**\n"
+                    "- AI 模型服务暂时过载或不可用\n"
+                    "- 网络连接异常\n\n"
+                    "**建议：**\n"
+                    "- 请稍后重试\n"
+                    "- 系统将自动切换到备用模型\n\n"
+                    "---\n"
+                    "*EVA 系统会持续监控模型可用性，并在恢复后立即通知。*"
+                )
+            reply_content = full_reply
             duration_ms = (datetime.now(timezone.utc) - agent_start).total_seconds() * 1000
             now = datetime.now(timezone.utc)
 
             asyncio.create_task(_persist_results(
                 db, session_id, current_user.id, body.content,
                 reply_content, duration_ms, now, perf_timing,
+                products=captured_products,
             ))
 
             # Structured perf log
@@ -195,7 +232,7 @@ async def stream_chat_hybrid(
     session_id: str,
     body: SendMessageRequest,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_user),
+    current_user: User = Depends(check_quota),
 ):
     """Hybrid AI streaming endpoint — v7 multi-source intelligence.
 
@@ -203,6 +240,15 @@ async def stream_chat_hybrid(
     conflict resolution, and hallucination guard.
     The original /stream endpoint is preserved unchanged.
     """
+    # --- Rate limit check ---
+    await check_rate_limit(current_user)
+
+    # --- Content safety check ---
+    from app.core.content_filter import filter_content
+    safety_result = filter_content(body.content)
+    if not safety_result.passed:
+        raise HTTPException(status_code=400, detail=safety_result.reason)
+
     from sqlalchemy.orm import selectinload
     q = (
         select(ChatSession)
@@ -235,6 +281,7 @@ async def stream_chat_hybrid(
         full_reply = ""
         perf_timing: dict = {}
         hybrid_meta: dict = {}
+        captured_products: list[dict] = []  # Capture products for persistence
         try:
             async for chunk in run_hybrid_agent_stream(body.content, chat_history, current_user.id):
                 # Extract final_report for persistence
@@ -246,6 +293,17 @@ async def stream_chat_hybrid(
                         text = data.get("markdown", "")
                         if text:
                             full_reply = text
+                    except Exception:
+                        pass
+                # Capture products from agent_result for persistence
+                if "agent_result" in chunk:
+                    try:
+                        prefix = "data: "
+                        data_str = chunk[len(prefix):] if chunk.startswith(prefix) else chunk
+                        data = json.loads(data_str)
+                        products = data.get("products", [])
+                        if products:
+                            captured_products = products
                     except Exception:
                         pass
                 # Capture perf timing
@@ -271,13 +329,25 @@ async def stream_chat_hybrid(
                 yield chunk
 
             # Background persistence
-            reply_content = full_reply or "Hybrid AI 分析完成"
+            if not full_reply:
+                append_log("WARN", "Hybrid AI 返回空内容 — 所有 provider 可能均已失败")
+                full_reply = (
+                    "⚠️ **Hybrid AI 模型暂时不可用**\n\n"
+                    "很抱歉，当前所有 AI 模型服务均未能返回有效响应。\n\n"
+                    "**建议：**\n"
+                    "- 请稍后重试\n"
+                    "- 尝试使用标准模式\n\n"
+                    "---\n"
+                    "*EVA 系统正在自动恢复中。*"
+                )
+            reply_content = full_reply
             duration_ms = (datetime.now(timezone.utc) - agent_start).total_seconds() * 1000
             now = datetime.now(timezone.utc)
 
             asyncio.create_task(_persist_results(
                 db, session_id, current_user.id, body.content,
                 reply_content, duration_ms, now, perf_timing,
+                products=captured_products,
             ))
 
             # Structured perf log
@@ -301,6 +371,128 @@ async def stream_chat_hybrid(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.websocket("/sessions/{session_id}/ws")
+async def websocket_chat(
+    websocket: WebSocket,
+    session_id: str,
+):
+    """WebSocket 端点 — 实时双向聊天，作为 SSE 的替代方案。
+
+    客户端发送: {"type": "message", "content": "..."}
+    服务端回复: {"type": "token"|"final_report"|"error"|"done", ...}
+    """
+    await websocket.accept()
+
+    try:
+        # 验证 token（从查询参数获取）
+        token = websocket.query_params.get("token", "")
+        if not token:
+            await websocket.send_json({"type": "error", "message": "缺少认证 token"})
+            await websocket.close()
+            return
+
+        from app.core.security import decode_token
+        from app.core.database import async_session
+        from app.models.user import User
+        from sqlalchemy import select
+
+        try:
+            payload = decode_token(token)
+            user_id = payload.get("sub")
+        except Exception:
+            await websocket.send_json({"type": "error", "message": "token 无效"})
+            await websocket.close()
+            return
+
+        async with async_session() as db:
+            result = await db.execute(select(User).where(User.id == user_id))
+            user = result.scalar_one_or_none()
+            if not user:
+                await websocket.send_json({"type": "error", "message": "用户不存在"})
+                await websocket.close()
+                return
+
+            # 验证 session 归属
+            from app.models.chat import ChatSession
+            from sqlalchemy.orm import selectinload
+            q = select(ChatSession).options(selectinload(ChatSession.messages)).where(
+                ChatSession.id == session_id, ChatSession.user_id == user_id
+            )
+            result = await db.execute(q)
+            session = result.scalar_one_or_none()
+            if not session:
+                await websocket.send_json({"type": "error", "message": "会话不存在"})
+                await websocket.close()
+                return
+
+            # 构建历史
+            history = sorted(session.messages or [], key=lambda m: m.created_at)
+            chat_history = [{"role": m.role, "content": m.content} for m in history[-20:]]
+
+        # 循环接收消息
+        while True:
+            data = await websocket.receive_json()
+            msg_type = data.get("type", "message")
+
+            if msg_type == "message":
+                content = data.get("content", "")
+                if not content.strip():
+                    continue
+
+                # 安全检查
+                from app.core.content_filter import filter_content
+                safety = filter_content(content)
+                if not safety.passed:
+                    await websocket.send_json({"type": "error", "message": safety.reason})
+                    continue
+
+                from app.services.agent_service import run_agent_stream
+                from app.services.agent_service import _sse as _ws_sse
+
+                async for chunk in run_agent_stream(content, chat_history, user_id):
+                    # 转换 SSE 格式为 JSON
+                    if chunk.startswith("data: "):
+                        try:
+                            event = json.loads(chunk[6:])
+                            await websocket.send_json(event)
+                        except json.JSONDecodeError:
+                            pass
+
+            elif msg_type == "ping":
+                await websocket.send_json({"type": "pong"})
+
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass  # 连接异常关闭
+
+
+async def _record_price_history(conn, products: list[dict], now):
+    """为搜索结果中的每个有价商品记录价格快照。"""
+    if not products:
+        return
+    try:
+        from app.models.price_history import PriceHistory
+        import uuid as _uuid
+        records = []
+        for p in products:
+            price = p.get("price", 0)
+            if isinstance(price, (int, float)) and price > 0:
+                pid = p.get("id", hashlib.md5(p.get("name", "").encode()).hexdigest()[:12])
+                records.append({
+                    "id": str(_uuid.uuid4()),
+                    "product_id": pid,
+                    "platform": str(p.get("platform", "")),
+                    "price": float(price),
+                    "original_price": float(p.get("original_price", 0)) if p.get("original_price") else None,
+                    "recorded_at": now,
+                })
+        if records:
+            await conn.execute(PriceHistory.__table__.insert(), records)
+    except Exception:
+        pass  # 价格历史非关键路径，失败不影响主流程
 
 
 async def _save_user_message_async(
@@ -339,9 +531,20 @@ async def _persist_results(
     duration_ms: float,
     now: datetime,
     perf_timing: dict | None = None,
+    products: list[dict] | None = None,
 ) -> None:
-    """Persist chat message, report, and agent run in parallel."""
+    """Persist chat message, report, and agent run in parallel.
+
+    成功持久化后，对非管理员用户扣减1个问题额度。
+    """
     try:
+        # Build metadata with products for session history restoration
+        msg_metadata: dict = {"source": "agent"}
+        if products:
+            msg_metadata["products"] = products
+        if perf_timing:
+            msg_metadata["perf"] = perf_timing
+
         async with db.bind.connect() as conn:
             await asyncio.gather(
                 conn.execute(
@@ -350,7 +553,7 @@ async def _persist_results(
                         session_id=session_id,
                         role="assistant",
                         content=reply_content,
-                        metadata_={"source": "agent"},
+                        metadata_=msg_metadata,
                         created_at=now,
                     )
                 ),
@@ -362,7 +565,7 @@ async def _persist_results(
                         type="agent_report",
                         content={"markdown": reply_content},
                         summary=reply_content[:200],
-                        products=[],
+                        products=products or [],
                         created_at=now,
                     )
                 ),
@@ -378,7 +581,35 @@ async def _persist_results(
                         created_at=now,
                     )
                 ),
+                # v10: 记录价格历史（每个商品一条快照）
+                _record_price_history(conn, products or [], now),
+            )
+            # 扣减用户额度（管理员不扣减，失败不扣减）
+            from app.models.user import User, UserRole
+            from sqlalchemy import update
+            await conn.execute(
+                update(User)
+                .where(User.id == user_id, User.role != UserRole.admin, User.remaining_questions > 0)
+                .values(
+                    remaining_questions=User.remaining_questions - 1,
+                    total_questions_used=User.total_questions_used + 1,
+                )
             )
             await conn.commit()
+
+        # v10: 后台自动摘要（不阻塞主流程）
+        asyncio.create_task(_auto_summarize_background(user_id, session_id, query, reply_content))
+
     except Exception as e:
         append_log("ERROR", f"持久化失败: {str(e)[:100]}")
+
+
+async def _auto_summarize_background(user_id: str, session_id: str, query: str, reply: str):
+    """后台自动生成记忆摘要。"""
+    try:
+        from app.services.memory_service import auto_summarize_session
+        saved = await auto_summarize_session(user_id, session_id, query, reply)
+        if saved > 0:
+            append_log("SUCCESS", f"记忆自动化: 从会话 {session_id[:8]} 提取了 {saved} 条记忆")
+    except Exception as e:
+        append_log("DEBUG", f"记忆自动化跳过: {type(e).__name__}")

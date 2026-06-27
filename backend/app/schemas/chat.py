@@ -38,7 +38,7 @@ class CreateSessionRequest(BaseModel):
 
 
 class SendMessageRequest(BaseModel):
-    content: str = Field(min_length=1)
+    content: str = Field(min_length=1, max_length=4000, description="用户消息内容（1-4000字符）")
 
 
 class SendMessageResponse(BaseModel):

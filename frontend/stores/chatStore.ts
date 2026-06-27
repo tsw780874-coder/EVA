@@ -121,6 +121,10 @@ interface ChatState {
   useHybrid: boolean;  // v7: enables multi-source intelligence
   hybrid: HybridState;  // v8: hybrid AI state
 
+  // Per-session product cache — survives session switches
+  productsBySession: Record<string, ProductData[]>;
+  favoritedIds: string[];  // product IDs already favorited in current session view
+
   loadSessions: () => Promise<void>;
   createSession: (title?: string) => Promise<ChatSession>;
   loadMessages: (sessionId: string) => Promise<void>;
@@ -136,6 +140,9 @@ interface ChatState {
   toggleHybrid: () => void;
   updateHybrid: (patch: Partial<HybridState>) => void;  // v8
   resetHybrid: () => void;  // v8
+  setProducts: (sessionId: string, products: ProductData[]) => void;
+  addFavoritedId: (productId: string) => void;
+  clearFavorites: () => void;
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
@@ -148,6 +155,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   abortController: null,
   useHybrid: true,  // v7 hybrid by default, with graceful fallback
   hybrid: { ...EMPTY_HYBRID },  // v8 hybrid state
+  productsBySession: {},  // per-session product cache
+  favoritedIds: [],
 
   loadSessions: async () => {
     const data = await api<ChatSession[]>("/api/v1/chat/sessions");
@@ -171,7 +180,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   selectSession: async (sessionId) => {
-    const data = await api<{ id: string; title: string; created_at: string; updated_at: string; messages: ChatMessage[] }>(
+    const data = await api<{
+      id: string; title: string; created_at: string; updated_at: string;
+      messages: (ChatMessage & { metadata_?: Record<string, unknown> | null })[];
+    }>(
       `/api/v1/chat/sessions/${sessionId}`
     );
     set({
@@ -184,6 +196,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
       },
       messages: data.messages,
     });
+
+    // Restore products from the last assistant message's metadata
+    const state = get();
+    if (!state.productsBySession[sessionId]) {
+      // Scan messages in reverse to find the most recent agent_result products
+      for (let i = data.messages.length - 1; i >= 0; i--) {
+        const meta = data.messages[i]?.metadata_;
+        if (meta && Array.isArray((meta as any).products) && (meta as any).products.length > 0) {
+          state.setProducts(sessionId, (meta as any).products as ProductData[]);
+          break;
+        }
+      }
+    }
   },
 
   deleteSession: async (sessionId) => {
@@ -199,48 +224,39 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({ isStreaming: true, streamEvents: [], streamTokens: "" });
 
     const { useHybrid } = get();
-    // v7: Use hybrid endpoint for multi-source intelligence
-    // Falls back to original endpoint if hybrid is unavailable
     const streamPath = useHybrid
       ? `/api/v1/chat/sessions/${sessionId}/stream/hybrid`
       : `/api/v1/chat/sessions/${sessionId}/stream`;
+
+    const onFinally = () => {
+      set({ isStreaming: false });
+      onDone();
+    };
 
     const controller = await apiSSE(
       streamPath,
       { content },
       (event) => {
-        set((s) => ({
-          streamEvents: [...s.streamEvents, event],
-          streamTokens: event.type === "token"
-            ? s.streamTokens + (event.text || "")
-            : s.streamTokens,
-        }));
-        const sseEvent = event as unknown as SSEEvent;
-        onEvent(sseEvent);
+        // v7: 纯回调 — 不经过 Zustand store，避免每次事件触发全局 rerender
+        onEvent(event as unknown as SSEEvent);
       },
       () => {
         set({ isStreaming: false });
         onDone();
       },
-      // Graceful fallback: if hybrid endpoint fails, retry with original
       async (err) => {
         if (useHybrid && err.message.includes("404")) {
-          // Hybrid endpoint not available, fallback to original
           set({ useHybrid: false });
           try {
             await get().sendMessage(sessionId, content, onEvent, onDone);
             return;
           } catch {
-            // Fallback also failed, report error
+            // Fallback also failed
           }
         }
         set({ isStreaming: false });
-        set((s) => ({
-          streamEvents: [
-            ...s.streamEvents,
-            { type: "error", message: err.message },
-          ],
-        }));
+        // 直接通过 onEvent 报告错误，不经过 store
+        onEvent({ type: "error", message: err.message } as unknown as SSEEvent);
         onDone();
       },
     );
@@ -266,5 +282,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   resetHybrid: () => {
     set({ hybrid: { ...EMPTY_HYBRID } });
+  },
+
+  setProducts: (sessionId, products) => {
+    set((s) => ({
+      productsBySession: { ...s.productsBySession, [sessionId]: products },
+    }));
+  },
+
+  addFavoritedId: (productId) => {
+    set((s) => ({
+      favoritedIds: s.favoritedIds.includes(productId)
+        ? s.favoritedIds
+        : [...s.favoritedIds, productId],
+    }));
+  },
+
+  clearFavorites: () => {
+    set({ favoritedIds: [] });
   },
 }));
