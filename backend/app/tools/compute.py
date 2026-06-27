@@ -1,22 +1,11 @@
-"""Compute Tool — 纯计算工具（含沙箱化自定义计算）
+"""Compute Tool — 纯计算工具
 
 数据源: CPU纯计算（价格分析、统计、汇率换算等）
 不涉及外部数据查询，仅做数学计算。
-
-v10: custom_calc — 子进程沙箱执行用户数学表达式
 """
-
-import subprocess
-import sys
-import tempfile
-import os
 
 from app.tools.schema import ToolResult, ToolStatus
 from app.tools.registry import registry
-
-# 沙箱配置
-_SANDBOX_TIMEOUT = 3
-_SANDBOX_MAX_OUTPUT = 1024
 
 
 @registry.register(
@@ -129,40 +118,6 @@ async def compute(
                 "percentage_diff": round(diff / max(prices[0], prices[1]) * 100, 1),
                 "cheaper": "A" if prices[0] < prices[1] else "B",
             }]
-
-        elif operation == "custom_calc":
-            # v10: 沙箱化自定义数学表达式 — subprocess 进程隔离
-            expr = str(original_price) if original_price > 0 else ""
-            if not expr or len(expr) > 200:
-                return ToolResult.failed(tool="compute", error="需要有效的表达式（最长200字符）")
-            # 安全过滤
-            safe = set("0123456789+-*/()., math.sqrt pow abs round sum min max statistics decimal fractions")
-            if any(c not in safe and not c.isalnum() and c not in ' _%' for c in expr):
-                return ToolResult.failed(tool="compute", error="表达式含不安全字符")
-            sandbox_code = f"""
-import math, statistics, decimal, fractions
-try:
-    result = eval({repr(expr)}, {{"__builtins__": {{}}}}, {{"math":math,"statistics":statistics}})
-    print(repr(result))
-except Exception as e:
-    print(f"ERROR: {{e}}")
-"""
-            try:
-                with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-                    f.write(sandbox_code)
-                    tmp_path = f.name
-                try:
-                    proc = subprocess.run([sys.executable, tmp_path], capture_output=True, timeout=_SANDBOX_TIMEOUT, text=True)
-                    output = proc.stdout.strip()[:_SANDBOX_MAX_OUTPUT]
-                    if output.startswith("ERROR:"):
-                        return ToolResult.failed(tool="compute", error=output)
-                    data = [{"operation": "custom_calc", "expression": expr, "result": output, "sandbox": True}]
-                finally:
-                    os.unlink(tmp_path)
-            except subprocess.TimeoutExpired:
-                return ToolResult.failed(tool="compute", error="计算超时")
-            except Exception as e:
-                return ToolResult.failed(tool="compute", error=f"沙箱执行失败: {e}")
 
         else:
             return ToolResult.failed(

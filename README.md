@@ -80,17 +80,17 @@ User Query
 
 ## 🧰 Tech Stack
 
-| 层级 | 技术 |
-|------|------|
-| **LLM** | DeepSeek · GPT-4o · Gemini · Groq LPU · GLM-4 · ERNIE — 8 provider 统一访问 |
-| **Agent** | 自研异步管道（无 LangGraph 依赖）— ReAct 循环 + Function Calling + Circuit Breaker |
-| **Backend** | FastAPI · Python 3.13+ · SQLAlchemy 2.0 (async) · Pydantic v2 |
-| **Frontend** | Next.js 16 · React 19 · TypeScript 5 · TailwindCSS v4 · Zustand · Framer Motion |
-| **Vector DB** | Milvus 2.4 — 1536-dim, IVF_FLAT index |
-| **Search** | BM25 + Vector 混合检索 · Reranker (freshness + keyword + LLM) |
-| **Cache** | Redis 7 + in-memory fallback · Semantic cache (3-level) |
-| **Database** | MySQL 8.4 (prod) / SQLite (dev) |
-| **Deploy** | Docker Compose · Nginx reverse proxy |
+| 层级          | 技术                                                         |
+| ------------- | ------------------------------------------------------------ |
+| **LLM**       | DeepSeek · GPT-4o · Gemini · Groq LPU · GLM-4 · ERNIE — 8 provider 统一访问 |
+| **Agent**     | 自研异步管道（无 LangGraph 依赖）— ReAct 循环 + Function Calling + Circuit Breaker |
+| **Backend**   | FastAPI · Python 3.13+ · SQLAlchemy 2.0 (async) · Pydantic v2 |
+| **Frontend**  | Next.js 16 · React 19 · TypeScript 5 · TailwindCSS v4 · Zustand · Framer Motion |
+| **Vector DB** | Milvus 2.4 — 1536-dim, IVF_FLAT index                        |
+| **Search**    | BM25 + Vector 混合检索 · Reranker (freshness + keyword + LLM) |
+| **Cache**     | Redis 7 + in-memory fallback · Semantic cache (3-level)      |
+| **Database**  | MySQL 8.4 (prod) / SQLite (dev)                              |
+| **Deploy**    | Docker Compose · Nginx reverse proxy                         |
 
 ---
 
@@ -138,10 +138,10 @@ docker-compose up -d
 
 ### Default Accounts
 
-| Role | Email | Password | Quota |
-|------|-------|----------|-------|
+| Role  | Email         | Password | Quota     |
+| ----- | ------------- | -------- | --------- |
 | Admin | admin@eva.com | admin123 | Unlimited |
-| User | user@eva.com | user123 | 20/day |
+| User  | user@eva.com  | user123  | 20/day    |
 
 ---
 
@@ -222,11 +222,11 @@ Tool Registry (8 tools)
 
 三层门禁确保输出可信：
 
-| 门禁 | 职责 | 行为 |
-|------|------|------|
-| **DataQualityGate** | 商品数据入口过滤 | 拦截 source=simulated/template，price=0 仅标注不拦截 |
-| **VerificationGate** | 回答发布前验证（4 维检查） | BLOCK → SAFE_FALLBACK / FLAG → 附加警告 / ALLOW → 正常输出 |
-| **HallucinationGuard** | 6 维幻觉检测 | 标注警告，不阻断（由 VerificationGate 统一判定） |
+| 门禁                   | 职责                       | 行为                                                       |
+| ---------------------- | -------------------------- | ---------------------------------------------------------- |
+| **DataQualityGate**    | 商品数据入口过滤           | 拦截 source=simulated/template，price=0 仅标注不拦截       |
+| **VerificationGate**   | 回答发布前验证（4 维检查） | BLOCK → SAFE_FALLBACK / FLAG → 附加警告 / ALLOW → 正常输出 |
+| **HallucinationGuard** | 6 维幻觉检测               | 标注警告，不阻断（由 VerificationGate 统一判定）           |
 
 **核心原则**: 有证据 → 放行；零证据 → 拦截。不会阻止外部真实数据返回。
 
@@ -246,11 +246,11 @@ Documents → Chunker (recursive split, 512 tokens)
 
 ### Memory System (L1/L2/L3)
 
-| 层级 | 存储 | TTL | 用途 |
-|------|------|-----|------|
-| L1 Short-term | Redis session | 24h | 对话上下文 |
-| L2 Long-term | MySQL | permanent | 用户偏好、已确认事实、自动摘要 |
-| L3 Retrieval | Milvus vector | permanent | 语义记忆检索 |
+| 层级          | 存储          | TTL       | 用途                           |
+| ------------- | ------------- | --------- | ------------------------------ |
+| L1 Short-term | Redis session | 24h       | 对话上下文                     |
+| L2 Long-term  | MySQL         | permanent | 用户偏好、已确认事实、自动摘要 |
+| L3 Retrieval  | Milvus vector | permanent | 语义记忆检索                   |
 
 对话结束后 LLM 自动提取用户偏好和决策，存入 L2+L3 记忆。
 
@@ -299,13 +299,13 @@ EVA/
 
 ### Latency Targets
 
-| 场景 | 目标 | 实测 |
-|------|------|------|
-| 意图分类 | <1ms | <1ms |
-| 语义缓存命中 | <10ms | <10ms |
-| RAG 商品检索 | <500ms | 100-500ms |
+| 场景         | 目标   | 实测                        |
+| ------------ | ------ | --------------------------- |
+| 意图分类     | <1ms   | <1ms                        |
+| 语义缓存命中 | <10ms  | <10ms                       |
+| RAG 商品检索 | <500ms | 100-500ms                   |
 | LLM 首 token | <500ms | 200-900ms (6-provider 竞速) |
-| 完整购物分析 | <10s | 0.5-3s |
+| 完整购物分析 | <10s   | 0.5-3s                      |
 
 ### Optimizations
 

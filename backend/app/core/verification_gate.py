@@ -265,11 +265,11 @@ class VerificationGate:
                     f"但所有来源中均未找到任何价格数据"
                 )
 
-        # 检查回答长度 vs 证据量（含商品数据）
-        total_sources = len(evidence) + len(products)
-        if len(answer) > 200 and total_sources <= 1:
+        # 检查回答长度 vs 证据量
+        if len(answer) > 200 and len(evidence) <= 1:
+            # 长回答但只有一条证据 → 可能扩展了未验证内容
             issues.append(
-                f"回答较长 ({len(answer)}字) 但仅基于 {total_sources} 个来源，"
+                f"回答较长 ({len(answer)}字) 但仅基于 {len(evidence)} 条证据，"
                 f"可能存在扩展推测"
             )
 
