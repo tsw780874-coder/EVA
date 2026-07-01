@@ -16,8 +16,9 @@ from typing import Callable, Awaitable, Sequence
 from app.core.llm import get_llm_client, get_model_name, track_token_usage, track_model_latency
 from app.api.v1.admin import append_log
 
-# Default providers — ALL are tried simultaneously (true parallel race, FIRST_COMPLETED wins)
-DEFAULT_PROVIDERS = ["deepseek", "gemini_flash", "deepseek_flash", "gemini_pro", "groq", "glm_flash"]
+# Default providers — ALL are tried simultaneously (true parallel race, FIRST_COMPLETED wins).
+# Only includes providers actually registered in MODEL_TIERS (llm.py).
+DEFAULT_PROVIDERS = ["deepseek", "groq", "glm_flash", "glm47_flash", "ernie_speed", "ernie35"]
 MAX_ATTEMPTS = 6  # v10: 全量并行竞速（不再限制4个），最快 provider 返回即取消其余
 _LLM_CALL_TIMEOUT = 5.0  # per-provider timeout (balanced: fast enough, reliable enough)
 
@@ -29,6 +30,26 @@ _CACHE_TTL = 300
 def _cache_key(*parts: str) -> str:
     """Generate cache key from one or more strings."""
     return hashlib.sha256("|||".join(parts).encode()).hexdigest()
+
+
+def _has_api_key(provider: str) -> bool:
+    """Check if a provider has a non-empty API key configured."""
+    try:
+        from app.core.llm import get_llm_client
+        settings = __import__('app.config', fromlist=['get_settings']).get_settings()
+        key_map = {
+            "deepseek": settings.deepseek_api_key,
+            "openai": settings.openai_api_key,
+            "glm_flash": getattr(settings, "glm_flash_api_key", ""),
+            "glm47_flash": getattr(settings, "glm47_flash_api_key", ""),
+            "ernie_speed": getattr(settings, "ernie_speed_api_key", ""),
+            "ernie35": getattr(settings, "ernie35_api_key", ""),
+            "seedream": getattr(settings, "seedream_api_key", ""),
+            "groq": getattr(settings, "groq_api_key", ""),
+        }
+        return bool(key_map.get(provider, "").strip())
+    except Exception:
+        return True  # If can't check, don't filter out
 
 
 # ── Token estimation ──
@@ -166,7 +187,10 @@ async def llm_call(
     provider_list = list(providers or DEFAULT_PROVIDERS)
     if not provider_list:
         provider_list = list(DEFAULT_PROVIDERS)
-    provider_list = provider_list[:MAX_ATTEMPTS]
+    # Filter out providers with empty API keys (avoids wasting race slots)
+    provider_list = [p for p in provider_list[:MAX_ATTEMPTS] if _has_api_key(p)]
+    if not provider_list:
+        provider_list = ["deepseek"]  # fallback to default
     timeout = per_provider_timeout or _LLM_CALL_TIMEOUT
 
     async def _try_provider(provider: str) -> tuple[str, str] | None:
@@ -204,22 +228,34 @@ async def llm_call(
                 buffer: list[str] = []
                 MIN_CHUNK_SIZE = 3  # 合并小块（至少3字符才发送回调）
 
-                async for chunk in resp:
-                    delta = chunk.choices[0].delta if chunk.choices else None
-                    if delta and delta.content:
-                        chunks.append(delta.content)
-                        buffer.append(delta.content)
-                        # 缓冲足够大或遇到标点时才发送回调
-                        combined = "".join(buffer)
-                        if len(combined) >= MIN_CHUNK_SIZE or any(
-                            punct in combined for punct in ("。", "！", "？", "\n", "，", ".", "!", "?", ",")
-                        ):
-                            await stream_callback(combined)
-                            buffer.clear()
+                # v10修复: 用 asyncio.wait_for 包裹整个chunk收集过程
+                # 防止provider在流式传输中途挂起导致永久阻塞
+                STREAM_TOTAL_TIMEOUT = timeout * 2  # 2×单provider超时（流式收集不应超过单次调用2倍）
 
-                # 发送剩余缓冲
-                if buffer:
-                    await stream_callback("".join(buffer))
+                async def _collect_chunks():
+                    nonlocal chunks, buffer
+                    async for chunk in resp:
+                        delta = chunk.choices[0].delta if chunk.choices else None
+                        if delta and delta.content:
+                            chunks.append(delta.content)
+                            buffer.append(delta.content)
+                            combined = "".join(buffer)
+                            if len(combined) >= MIN_CHUNK_SIZE or any(
+                                punct in combined for punct in ("。", "！", "？", "\n", "，", ".", "!", "?", ",")
+                            ):
+                                await stream_callback(combined)
+                                buffer.clear()
+                    # 发送剩余缓冲
+                    if buffer:
+                        await stream_callback("".join(buffer))
+
+                try:
+                    await asyncio.wait_for(_collect_chunks(), timeout=STREAM_TOTAL_TIMEOUT)
+                except asyncio.TimeoutError:
+                    append_log("WARN", f"{node_name} stream timeout after {STREAM_TOTAL_TIMEOUT:.0f}s, provider={provider}")
+                    # 发送已收集的部分内容（如果有）
+                    if buffer:
+                        await stream_callback("".join(buffer))
 
                 content = "".join(chunks)
             else:
@@ -254,6 +290,9 @@ async def llm_call(
                 append_log("DEBUG", f"{node_name} Redis缓存写入失败: {type(e).__name__}")
 
             return content, provider
+        except asyncio.CancelledError:
+            # Provider was cancelled because a faster provider won — NOT a failure
+            return None
         except (asyncio.TimeoutError, Exception) as e:
             breaker.on_failure(str(e)[:100])  # 报告失败 → 累加熔断计数
             return None
@@ -264,7 +303,7 @@ async def llm_call(
     # 所有 provider 同时启动，谁先返回有效结果就用谁，其余立即取消。
     # 单个 provider 超时 = per_provider_timeout (默认5s)，不阻塞其他。
     tasks = [asyncio.create_task(_try_provider(p)) for p in provider_list]
-    racing_timeout = timeout * 2  # 总超时 = 2×单provider超时（给足并行竞争时间）
+    racing_timeout = timeout * 1.2  # 总超时 = 1.2×单provider超时（各provider内部已有5s超时）
 
     try:
         done, pending = await asyncio.wait(
@@ -434,6 +473,9 @@ async def llm_call_with_tools(
             breaker.on_success()
             return [], provider
 
+        except asyncio.CancelledError:
+            # Provider was cancelled because a faster provider won — NOT a failure
+            return None
         except (asyncio.TimeoutError, Exception) as e:
             breaker.on_failure(str(e)[:100])
             return None
@@ -442,7 +484,7 @@ async def llm_call_with_tools(
 
     # v10: True Parallel Race (same simplified pattern as llm_call)
     tasks = [asyncio.create_task(_try_provider(p)) for p in provider_list]
-    racing_timeout = timeout * 2
+    racing_timeout = timeout * 1.2  # 与 llm_call 保持一致：1.2×单provider超时
 
     try:
         done, pending = await asyncio.wait(

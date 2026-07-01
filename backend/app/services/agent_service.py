@@ -28,7 +28,7 @@ from app.core.verification_gate import VerificationGate, verify_response, safe_f
 from app.hybrid.guard import check_hallucination
 from app.config import get_settings
 
-FALLBACK_ORDER = ["deepseek", "gemini_flash", "deepseek_flash", "gemini_pro", "openai", "glm47_flash", "glm_flash", "ernie_speed", "ernie35"]
+FALLBACK_ORDER = ["deepseek", "glm47_flash", "glm_flash", "ernie_speed", "ernie35", "groq", "openai"]
 
 
 def get_active_fallback() -> str | None:
@@ -72,11 +72,14 @@ async def run_agent_stream(
 
     # ── 4. 非购物意图 → 轻量 LLM 调用 ──
     if not is_shopping_intent(intent_result):
-        result = await run_pipeline(
-            user_query=user_query,
-            user_id=user_id,
-            bypass_cache=False,
-            chat_history=llm_context,
+        result = await asyncio.wait_for(
+            run_pipeline(
+                user_query=user_query,
+                user_id=user_id,
+                bypass_cache=False,
+                chat_history=llm_context,
+            ),
+            timeout=settings.pipeline_total_timeout_ms / 1000.0,
         )
         yield _sse({"type": "agent_progress", "agent": "analysis_pipeline", "message": "综合分析"})
         if result.get("final_report"):
@@ -238,10 +241,13 @@ async def run_agent_stream(
         # 工具规划失败不阻塞主流程
         append_log("WARN", f"Tool planning skipped: {type(e).__name__}: {str(e)[:80]}")
 
-    # 5b. Pipeline 搜索（唯一任务 — 不再并行LLM）
+    # 5b. Pipeline 搜索（唯一任务 — 不再并行LLM，含全局超时保护）
     pipeline_task = asyncio.create_task(
-        run_pipeline(user_query=user_query, user_id=user_id,
-                     stream_callback=token_callback, chat_history=llm_context)
+        asyncio.wait_for(
+            run_pipeline(user_query=user_query, user_id=user_id,
+                         stream_callback=token_callback, chat_history=llm_context),
+            timeout=settings.pipeline_total_timeout_ms / 1000.0,
+        )
     )
 
     # 5c. 等待 + 心跳
@@ -266,6 +272,19 @@ async def run_agent_stream(
     # ── 6. 获取 Pipeline 结果 ──
     try:
         result = pipeline_task.result()
+    except asyncio.TimeoutError:
+        append_log("WARN", "Pipeline 全局超时 — 返回部分结果或降级响应")
+        yield _sse({"type": "final_report", "markdown": (
+            "## ⏱️ 请求处理超时\n\n"
+            "搜索分析耗时超过了系统限制，请尝试以下操作：\n\n"
+            "- **简化查询**：使用更具体的商品名称或品牌\n"
+            "- **缩小范围**：指定平台或价格区间\n"
+            "- **稍后重试**：高峰时段可能响应较慢\n\n"
+            "---\n*EVA 系统已自动优化，下次查询将更快响应。*"
+        )})
+        yield _sse({"type": "error", "message": "请求处理超时，请简化查询后重试"})
+        yield _sse({"type": "done"})
+        return
     except Exception as e:
         append_log("ERROR", f"Agent 异常: {str(e)[:100]}")
         fallback = get_active_fallback()
@@ -431,6 +450,15 @@ async def run_agent_stream(
     }
     yield _sse(trust_data)
 
+    # ── 9.5 v11: Debug Trace — 每层检索命中状态 ──
+    if result.get("trace"):
+        yield _sse({"type": "trace",
+                     "status": result.get("status", "unknown"),
+                     "query": result.get("query", ""),
+                     "rewritten_query": result.get("rewritten_query", ""),
+                     "error_code": result.get("error_code"),
+                     "trace": result["trace"]})
+
     # ── 10. Perf timing ──
     if result.get("perf"):
         yield _sse({"type": "perf", "timing": result["perf"]})
@@ -528,10 +556,13 @@ async def run_hybrid_agent_stream(
         )
     )
 
-    # v6 Pipeline task
+    # v6 Pipeline task (含全局超时保护)
     pipeline_task = asyncio.create_task(
-        run_pipeline(user_query=user_query, user_id=user_id,
-                     stream_callback=token_callback, chat_history=llm_context)
+        asyncio.wait_for(
+            run_pipeline(user_query=user_query, user_id=user_id,
+                         stream_callback=token_callback, chat_history=llm_context),
+            timeout=settings.pipeline_total_timeout_ms / 1000.0,
+        )
     )
 
     # ── 5. Streaming drain loop — heartbeat + pipeline-first emission ──
@@ -675,6 +706,21 @@ async def run_hybrid_agent_stream(
             confidence_level=CL.HIGH if v6_confidence >= 70 else CL.MEDIUM if v6_confidence >= 40 else CL.LOW,
             warnings=["HybridAI引擎暂时不可用，仅使用v6管线结果。"],
         )
+
+    # ── v10修复: 将 pipeline 的 RAG docs 注入 hybrid 元数据 ──
+    # pipeline 已完成（BUG #1 修复确保 rag_docs 已包含在 result 中）
+    pipeline_rag_docs = result.get("rag_docs", [])
+    if pipeline_rag_docs and SourceType.RAG not in hybrid_result.sources_used:
+        # Pipeline找到RAG数据但hybrid任务未标记RAG来源 → 补充标记
+        hybrid_result.sources_used.append(SourceType.RAG)
+        if not hybrid_result.confidence_breakdown:
+            hybrid_result.confidence_breakdown = {}
+        hybrid_result.confidence_breakdown["rag_evidence"] = min(len(pipeline_rag_docs) * 5, 25)
+        # 如果有RAG证据但幻觉检查未通过，添加证据上下文
+        if not hybrid_result.hallucination_checks_passed and pipeline_rag_docs:
+            hybrid_result.warnings.append(
+                f"Pipeline发现{len(pipeline_rag_docs)}条RAG证据，已补充到上下文。"
+            )
 
     # ── 8. Emit hybrid supplementary events (metadata only, final_report already sent) ──
     yield _sse({"type": "hybrid_sources", "sources": [

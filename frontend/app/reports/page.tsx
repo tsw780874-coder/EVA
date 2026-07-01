@@ -22,6 +22,7 @@ interface ReportDetail {
   title: string;
   type: string;
   content: {
+    // Structured fields (when available from pipeline analysis)
     price_trend?: { day: string; price: number }[];
     platform_comparison?: { name: string; price: number; color: string }[];
     dimensions?: { label: string; score: number }[];
@@ -29,6 +30,8 @@ interface ReportDetail {
     suggested_price?: number;
     suggested_platform?: string;
     confidence?: string;
+    // Fallback: markdown-only content (from simple agent reports)
+    markdown?: string;
   } | null;
   products: { name: string; platform: string; price: number }[] | null;
   summary: string | null;
@@ -74,12 +77,15 @@ export default function ShoppingReport() {
   };
 
   const content = activeReport?.content;
+  // Handle both structured content and markdown-only fallback
+  const markdownContent = content?.markdown || null;
+  const hasStructuredData = !!(content?.price_trend?.length || content?.platform_comparison?.length || content?.dimensions?.length);
   const priceData = content?.price_trend || [];
   const platformData = content?.platform_comparison || [];
   const dimensions = content?.dimensions || [];
   const suggestedPrice = content?.suggested_price ?? activeReport?.products?.[0]?.price ?? null;
   const suggestedPlatform = content?.suggested_platform ?? activeReport?.products?.[0]?.platform ?? null;
-  const confidence = content?.recommendation ?? (activeReport?.summary || null);
+  const confidence = content?.recommendation ?? (activeReport?.summary || markdownContent || null);
   const reportTitle = activeReport?.title || null;
   const reportId = activeReport?.id ? `#EVA-${activeReport.id.slice(0, 8).toUpperCase()}` : null;
   const reportDate = activeReport?.created_at
@@ -167,6 +173,17 @@ export default function ShoppingReport() {
 
         {/* 左侧核心指标 */}
         <div className="lg:col-span-4 space-y-12">
+          {/* Markdown-only fallback: when no structured data, show full markdown report */}
+          {!hasStructuredData && markdownContent && (
+            <motion.div {...fadeInUp} className="p-10 bg-indigo-50/30 rounded-[40px] border border-indigo-100/50">
+              <h3 className="text-xs font-black tracking-[0.2em] text-indigo-500 mb-8 flex items-center gap-2">
+                <ArrowDownRight size={16} /> 分析报告
+              </h3>
+              <div className="text-sm text-gray-700 leading-relaxed whitespace-pre-wrap">
+                {markdownContent}
+              </div>
+            </motion.div>
+          )}
           <motion.div {...fadeInUp} className="p-10 bg-indigo-50/30 rounded-[40px] border border-indigo-100/50">
             <h3 className="text-xs font-black tracking-[0.2em] text-indigo-500 mb-8 flex items-center gap-2">
               <ArrowDownRight size={16} /> 核心结论

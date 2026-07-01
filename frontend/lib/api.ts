@@ -1,5 +1,10 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
+// ── Timeout constants ──
+const REST_TIMEOUT_MS = 30_000;   // 30s for regular REST calls
+const SSE_TIMEOUT_MS = 120_000;   // 2 min for SSE streaming
+const SSE_IDLE_TIMEOUT_MS = 30_000; // 30s idle (no data) triggers abort
+
 let accessToken: string | null = null;
 let refreshToken: string | null = null;
 let onAuthFailure: (() => void) | null = null;
@@ -49,6 +54,7 @@ async function refreshAccessToken(): Promise<boolean> {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ refresh_token: refreshToken }),
+      signal: AbortSignal.timeout(10_000),
     });
     if (!res.ok) return false;
     const data = await res.json();
@@ -72,13 +78,31 @@ export async function api<T = unknown>(
     headers["Authorization"] = `Bearer ${accessToken}`;
   }
 
-  let res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  // Merge user-provided signal with our timeout signal
+  const timeoutSignal = AbortSignal.timeout(REST_TIMEOUT_MS);
+  const combinedSignal = options.signal
+    ? AbortSignal.any([options.signal, timeoutSignal])
+    : timeoutSignal;
+
+  let res = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers,
+    signal: combinedSignal,
+  });
 
   if (res.status === 401 && refreshToken) {
     const refreshed = await refreshAccessToken();
     if (refreshed) {
       headers["Authorization"] = `Bearer ${accessToken}`;
-      res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+      // Re-create timeout signal for retry
+      const retrySignal = AbortSignal.timeout(REST_TIMEOUT_MS);
+      res = await fetch(`${API_BASE}${path}`, {
+        ...options,
+        headers,
+        signal: options.signal
+          ? AbortSignal.any([options.signal, retrySignal])
+          : retrySignal,
+      });
     } else {
       clearTokens();
       onAuthFailure?.();
@@ -87,8 +111,21 @@ export async function api<T = unknown>(
   }
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: "请求失败" }));
-    throw new Error(err.detail || `HTTP ${res.status}`);
+    let errMsg = `HTTP ${res.status}`;
+    try {
+      const errBody = await res.json();
+      // 支持多种后端错误格式: detail, message, error
+      const detail = errBody.detail || errBody.message || errBody.error;
+      if (typeof detail === 'string') {
+        errMsg = detail;
+      } else if (typeof detail === 'object' && detail !== null) {
+        // FastAPI validation error: detail is an array or object
+        errMsg = JSON.stringify(detail);
+      }
+    } catch {
+      // JSON parse failed — use HTTP status
+    }
+    throw new Error(errMsg);
   }
 
   return res.json();
@@ -105,6 +142,22 @@ export async function apiSSE(
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
 
+  // Global SSE timeout (2 min max for the entire stream)
+  const globalTimeoutId = setTimeout(() => {
+    controller.abort();
+    onError(new Error("请求超时：服务响应时间过长，请稍后重试"));
+  }, SSE_TIMEOUT_MS);
+
+  // Idle timeout: abort if no data received for 30s
+  let idleTimeoutId: ReturnType<typeof setTimeout> | null = null;
+  const resetIdleTimeout = () => {
+    if (idleTimeoutId) clearTimeout(idleTimeoutId);
+    idleTimeoutId = setTimeout(() => {
+      controller.abort();
+      onError(new Error("连接超时：长时间未收到数据，请检查网络后重试"));
+    }, SSE_IDLE_TIMEOUT_MS);
+  };
+
   try {
     const res = await fetch(`${API_BASE}${path}`, {
       method: "POST",
@@ -114,6 +167,24 @@ export async function apiSSE(
     });
 
     if (!res.ok) {
+      clearTimeout(globalTimeoutId);
+      if (idleTimeoutId) clearTimeout(idleTimeoutId);
+
+      // Handle 401 with token refresh for SSE
+      if (res.status === 401 && refreshToken) {
+        const refreshed = await refreshAccessToken();
+        if (refreshed) {
+          // Re-create controller and retry
+          onError(new Error("认证已刷新，请重试"));
+          return controller;
+        } else {
+          clearTokens();
+          onAuthFailure?.();
+          onError(new Error("认证已过期，请重新登录"));
+          return controller;
+        }
+      }
+
       const errData = await res.json().catch(() => null);
       onError(new Error(errData?.detail || `HTTP ${res.status}`));
       return controller;
@@ -121,6 +192,7 @@ export async function apiSSE(
 
     const reader = res.body?.getReader();
     if (!reader) {
+      clearTimeout(globalTimeoutId);
       onError(new Error("响应体不可读"));
       return controller;
     }
@@ -128,9 +200,15 @@ export async function apiSSE(
     const decoder = new TextDecoder();
     let buffer = "";
 
+    // Start idle timeout
+    resetIdleTimeout();
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+
+      // Reset idle timer on each chunk received
+      resetIdleTimeout();
 
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
@@ -141,6 +219,8 @@ export async function apiSSE(
           try {
             const data = JSON.parse(line.slice(6));
             if (data.type === "done") {
+              clearTimeout(globalTimeoutId);
+              if (idleTimeoutId) clearTimeout(idleTimeoutId);
               onDone();
               return controller;
             }
@@ -151,8 +231,13 @@ export async function apiSSE(
         }
       }
     }
+
+    clearTimeout(globalTimeoutId);
+    if (idleTimeoutId) clearTimeout(idleTimeoutId);
     onDone();
   } catch (err) {
+    clearTimeout(globalTimeoutId);
+    if (idleTimeoutId) clearTimeout(idleTimeoutId);
     if ((err as Error).name !== "AbortError") {
       onError(err as Error);
     }

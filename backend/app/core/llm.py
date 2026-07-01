@@ -86,6 +86,7 @@ TIER_QUOTA: dict[str, int] = {
 # === token 用量追踪（按用户隔离）===
 # { user_id: { provider_key: used_count } }
 _token_usage: dict[str, dict[str, int]] = {}
+_MAX_TOKEN_USAGE_ENTRIES = 10_000  # Evict oldest entries when exceeding this limit
 
 # === 实测延迟追踪（按 provider_key 存储最近一次测量值）===
 _model_latency: dict[str, float] = {}
@@ -214,10 +215,17 @@ def get_available_models(user_id: str | None = None) -> list[dict]:
 
 
 def track_token_usage(user_id: str, provider_key: str, token_count: int):
-    """追踪用户维度的 token 用量（用户间隔离）"""
+    """追踪用户维度的 token 用量（用户间隔离），带自动淘汰防止内存泄漏。"""
     if not user_id:
         return
     if user_id not in _token_usage:
+        # Evict oldest entries when dict grows too large
+        if len(_token_usage) >= _MAX_TOKEN_USAGE_ENTRIES:
+            # Remove 20% oldest entries (dict preserves insertion order in Python 3.7+)
+            to_remove = int(_MAX_TOKEN_USAGE_ENTRIES * 0.2)
+            keys = list(_token_usage.keys())[:to_remove]
+            for k in keys:
+                del _token_usage[k]
         _token_usage[user_id] = {}
     if provider_key not in _token_usage[user_id]:
         _token_usage[user_id][provider_key] = 0

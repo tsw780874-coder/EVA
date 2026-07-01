@@ -27,17 +27,30 @@ const SUGGESTED_QUERIES = [
   "分析近期唯品会美妆优惠趋势"
 ];
 
+function platformColor(platform: string) {
+  const map: Record<string, string> = {
+    "京东": "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
+    "天猫": "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
+    "淘宝": "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
+    "得物": "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
+    "拼多多": "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
+  };
+  return map[platform] || "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]";
+}
+
 export default function ChatStudio() {
   const [inputText, setInputText] = useState("");
   const [displayMessages, setDisplayMessages] = useState<DisplayMessage[]>([]);
   const [favoritingId, setFavoritingId] = useState<string | null>(null);
-  const [streamingText, setStreamingText] = useState("");  // token-level streaming
   const [sidebarOpen, setSidebarOpen] = useState(false);    // mobile sidebar toggle
   const [favError, setFavError] = useState<string | null>(null);  // favorite error feedback
   const [compareIds, setCompareIds] = useState<Set<string>>(new Set());  // v10: 对比选择
   const [showCompare, setShowCompare] = useState(false);  // v10: 对比面板
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const scrollThrottleRef = useRef<number>(0);
+  const tokenBufferRef = useRef<string>("");
+  const rafIdRef = useRef<number>(0);
   const user = useAuthStore((s) => s.user);
   const {
     sessions, currentSession,
@@ -53,12 +66,22 @@ export default function ChatStudio() {
   const products = currentSession?.id ? (productsBySession[currentSession.id] || []) : [];
 
   useEffect(() => { loadSessions().catch(() => {}); }, []);
+  // Cleanup RAF on unmount
+  useEffect(() => {
+    return () => {
+      if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
+    };
+  }, []);
   useEffect(() => {
     setSidebarOpen(false);
   }, [currentSession?.id]);
   useEffect(() => {
+    // Throttle scrollIntoView: at most once per 150ms to avoid layout thrashing
+    const now = performance.now();
+    if (now - scrollThrottleRef.current < 150) return;
+    scrollThrottleRef.current = now;
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [displayMessages, products, streamingText]);
+  }, [displayMessages, products]);
 
   const handleFavorite = async (p: ProductData) => {
     setFavoritingId(p.id);
@@ -101,7 +124,6 @@ export default function ChatStudio() {
     setDisplayMessages(displayMsgs);
     // Products are now per-session in store — they persist across session switches
     // No need to clear products; they're derived from productsBySession[currentSession.id]
-    setStreamingText("");
     setFavError(null);
     resetHybrid();
   };
@@ -110,7 +132,6 @@ export default function ChatStudio() {
     await deleteSession(sessionId);
     if (currentSession?.id === sessionId) {
       setDisplayMessages([]);
-      setStreamingText("");
       setFavError(null);
       resetHybrid();
       // Products for this session will be garbage-collected by store
@@ -122,7 +143,6 @@ export default function ChatStudio() {
     if (!content.trim() || isStreaming) return;
     setInputText('');
     setDisplayMessages((prev) => [...prev, { role: 'user', content }]);
-    setStreamingText("");
     setFavError(null);
     resetHybrid();
 
@@ -134,13 +154,36 @@ export default function ChatStudio() {
 
     let finalized = false;  // 防止 final_report 重复渲染
 
-    // Token append helper — 直接不可变更新，每 token 触发一次 setState
-    // React 18 自动批处理，不会造成性能问题
+    // Token append helper — batches tokens via rAF to avoid per-token re-render storm.
+    // Tokens arriving within the same animation frame are merged into a single setState.
+    const flushTokenBuffer = () => {
+      if (rafIdRef.current) {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = 0;
+      }
+      const batch = tokenBufferRef.current;
+      tokenBufferRef.current = "";
+      if (batch) {
+        setDisplayMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (!last || last.role !== 'assistant') return prev;
+          return [...prev.slice(0, -1), { ...last, content: (last.content || '') + batch }];
+        });
+      }
+    };
+
     const appendToken = (text: string) => {
-      setDisplayMessages((prev) => {
-        const last = prev[prev.length - 1];
-        if (!last || last.role !== 'assistant') return prev;
-        return [...prev.slice(0, -1), { ...last, content: (last.content || '') + text }];
+      tokenBufferRef.current += text;
+      if (rafIdRef.current) return; // already scheduled
+      rafIdRef.current = requestAnimationFrame(() => {
+        const batch = tokenBufferRef.current;
+        tokenBufferRef.current = "";
+        rafIdRef.current = 0;
+        setDisplayMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (!last || last.role !== 'assistant') return prev;
+          return [...prev.slice(0, -1), { ...last, content: (last.content || '') + batch }];
+        });
       });
     };
 
@@ -176,6 +219,7 @@ export default function ChatStudio() {
       // ── Final report → 替换最后一条消息的 content 为 markdown ──
       if (event.type === 'final_report' && !finalized) {
         finalized = true;
+        flushTokenBuffer(); // flush any buffered tokens first
         setDisplayMessages((prev) => {
           const rest = prev.slice(0, -1);
           return [...rest, { role: 'assistant', content: event.markdown || '' }];
@@ -188,19 +232,79 @@ export default function ChatStudio() {
       // ── Error event → replace last message with error ──
       if (event.type === 'error' && !finalized) {
         finalized = true;
+        flushTokenBuffer(); // flush any buffered tokens first
         setDisplayMessages((prev) => {
           const rest = prev.slice(0, -1);
           return [...rest, { role: 'assistant', content: `⚠️ 服务异常：${event.message || '未知错误'}，请稍后重试。` }];
         });
       }
 
-      // ── Trust/perf → 静默更新 store（不触发 UI rerender）──
+      // ── Trust → comprehensive hybrid metadata ──
       if (event.type === 'trust') {
-        updateHybrid({
+        const patch: Partial<typeof hybrid> = {
           confidence: event.confidence || 0,
           hallucinationPassed: event.hallucination_passed ?? true,
+        };
+        // Map confidence_level string to confLevel
+        if (event.data?.confidence_level || (event as any).confidence_level) {
+          patch.confLevel = ((event.data?.confidence_level || (event as any).confidence_level) as string);
+        }
+        // Map hybrid_sources string[] to sources HybridSourceInfo[]
+        if (event.hybrid_sources && Array.isArray(event.hybrid_sources)) {
+          patch.sources = event.hybrid_sources.map((s: string) => ({ source: s, label: s }));
+        }
+        // Map conflicts string[]
+        if (event.conflicts && Array.isArray(event.conflicts)) {
+          patch.conflicts = event.conflicts;
+        }
+        // Map warnings string[]
+        if (event.warnings && Array.isArray(event.warnings)) {
+          patch.warnings = event.warnings;
+        }
+        updateHybrid(patch);
+      }
+
+      // ── Hybrid sources → update source list with labels ──
+      if (event.type === 'hybrid_sources' && event.sources) {
+        updateHybrid({ sources: event.sources });
+      }
+
+      // ── Hybrid confidence → update confidence breakdown ──
+      if (event.type === 'hybrid_confidence') {
+        updateHybrid({
+          confidence: event.confidence || 0,
+          confLevel: event.level || '',
+          confBreakdown: event.breakdown || {},
         });
       }
+
+      // ── Hybrid conflict → update conflict list ──
+      if (event.type === 'hybrid_conflict' && event.conflicts) {
+        updateHybrid({ conflicts: event.conflicts });
+      }
+
+      // ── Hybrid guard → update hallucination status ──
+      if (event.type === 'hybrid_guard') {
+        updateHybrid({
+          hallucinationPassed: event.passed ?? false,
+          warnings: event.warnings || [],
+        });
+      }
+
+      // ── Verification → update verification status ──
+      if (event.type === 'verification') {
+        updateHybrid({
+          verification: {
+            passed: (event as any).passed ?? false,
+            action: event.action || 'allow',
+            confidence: (event as any).confidence || 0,
+            failedChecks: event.failed_checks || [],
+            warnings: event.warnings || [],
+          },
+        });
+      }
+
+      // ── Perf → update timing ──
       if (event.type === 'perf' && event.timing) {
         updateHybrid({ perfTiming: event.timing });
       }
@@ -223,17 +327,6 @@ export default function ChatStudio() {
       e.preventDefault();
       handleSend();
     }
-  };
-
-  const platformColor = (platform: string) => {
-    const map: Record<string, string> = {
-      "京东": "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
-      "天猫": "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
-      "淘宝": "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
-      "得物": "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
-      "拼多多": "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]",
-    };
-    return map[platform] || "bg-[#F9F8F6] text-[#8C7A6B] border-[#D4C9BC]";
   };
 
   return (

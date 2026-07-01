@@ -136,7 +136,7 @@ class Settings(BaseSettings):
     pipeline_mode: str = "fast"
 
     # 超时配置 (毫秒)
-    pipeline_total_timeout_ms: int = 8000      # Pipeline 全局超时
+    pipeline_total_timeout_ms: int = 45000     # Pipeline 全局超时 (45s, 涵盖LLM竞速+搜索)
     tool_execution_timeout_ms: int = 800       # 单工具执行超时
     llm_first_token_timeout_ms: int = 500      # LLM 首Token超时
     rag_search_timeout_ms: int = 500           # RAG搜索超时

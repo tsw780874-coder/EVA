@@ -115,6 +115,10 @@ async def stream_chat(
     if not safety_result.passed:
         raise HTTPException(status_code=400, detail=safety_result.reason)
 
+    # --- Empty/whitespace query check ---
+    if not body.content.strip():
+        raise HTTPException(status_code=400, detail="查询内容不能为空")
+
     # --- Single query: validate session + get history ---
     from sqlalchemy.orm import selectinload
     q = (
@@ -131,11 +135,12 @@ async def stream_chat(
     history = sorted(session.messages or [], key=lambda m: m.created_at)
     chat_history = [{"role": m.role, "content": m.content} for m in history[-20:]]
 
-    # Save user message in background — don't block SSE stream start
+    # v10修复: 同步等待用户消息保存完成，消除竞态条件
+    # _save_user_message_async 使用独立 DB session，不会与主请求 session 冲突
     session.updated_at = datetime.now(timezone.utc)
-    asyncio.create_task(_save_user_message_async(
+    await _save_user_message_async(
         session_id, current_user.id, body.content,
-    ))
+    )
 
     append_log("INFO", f"Agent 开始处理: {body.content[:50]}...")
 
@@ -248,6 +253,10 @@ async def stream_chat_hybrid(
     safety_result = filter_content(body.content)
     if not safety_result.passed:
         raise HTTPException(status_code=400, detail=safety_result.reason)
+
+    # --- Empty/whitespace query check ---
+    if not body.content.strip():
+        raise HTTPException(status_code=400, detail="查询内容不能为空")
 
     from sqlalchemy.orm import selectinload
     q = (

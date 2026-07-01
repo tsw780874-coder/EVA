@@ -190,6 +190,7 @@ _SIMILAR_PROMPT = (
 )
 
 # Fallback: absolutely no data found anywhere
+# v11 重构: 禁止生成LLM安慰话术 → 返回结构化空结果
 _NO_DATA_PROMPT = (
     "你是电商购物专家。经过多渠道搜索（知识库、商品缓存、电商平台），"
     "仍未找到用户查询的相关商品数据。"
@@ -198,6 +199,13 @@ _NO_DATA_PROMPT = (
     "2. 推荐访问京东、天猫等电商平台直接搜索\n"
     "3. 建议检查产品名称拼写或型号\n"
     "不要编造任何具体的商品价格或参数。"
+)
+
+# v11: 空结果标准输出 — 禁止LLM生成自然语言安慰文本
+EMPTY_RESULT_MESSAGE = (
+    "## 未找到相关商品\n\n"
+    "当前知识库和商品缓存中暂无匹配数据。\n\n"
+    "**建议**: 尝试使用具体的商品名称或型号搜索。"
 )
 
 
@@ -310,17 +318,47 @@ def _parse_product_from_content(
         except (ValueError, IndexError):
             pass
 
-    # Fallback: look for price patterns in content
-    price_match = re.search(r'[¥￥]\s*(\d[\d,]*)', content)
-    name_match = re.search(r'(?:name|名称|产品)[:：]\s*(.+)', content)
+    # Fallback: parse plain text product format (from generated data)
+    # Format: "商品名称: xxx\n品牌: xxx\n类别: xxx\n...\n多平台价格对比:\n  - 京东: Yxxx\n  - 天猫: Yxxx\n  - 拼多多: Yxxx"
+    name_match = re.search(r'(?:商品名称|name|名称|产品)[:：]\s*(.+)', content)
+    brand_match = re.search(r'(?:品牌)[:：]\s*(.+)', content)
+    category_match = re.search(r'(?:类别|品类)[:：]\s*(.+)', content)
+    rating_match = re.search(r'(?:评分)[:：]\s*([\d.]+)', content)
 
-    if price_match and name_match:
-        return {
-            "name": name_match.group(1).strip(),
-            "platform": "未知平台",
-            "price": float(price_match.group(1).replace(",", "")),
+    # Find all prices with platforms
+    platform_prices = re.findall(r'-\s*(京东|天猫|淘宝|拼多多|得物|抖音)[:：]\s*[¥￥]\s*([\d,]+)', content)
+    all_prices = re.findall(r'[¥￥]\s*([\d,]+)', content)
+
+    if name_match:
+        name = name_match.group(1).strip()
+        brand = brand_match.group(1).strip() if brand_match else ""
+        category = category_match.group(1).strip() if category_match else ""
+
+        # Best price (lowest from any platform)
+        prices = [float(p.replace(",", "")) for p in all_prices]
+        best_price = min(prices) if prices else 0.0
+
+        # Extract the platform with lowest price
+        platform = "多平台"
+        if platform_prices:
+            best_platform_price = None
+            for plat, price_str in platform_prices:
+                p = float(price_str.replace(",", ""))
+                if best_platform_price is None or p < best_platform_price:
+                    best_platform_price = p
+                    platform = plat
+
+        result = {
+            "name": name,
+            "platform": platform,
+            "price": best_price,
+            "original_price": max(prices) if len(prices) > 1 else None,
+            "rating": float(rating_match.group(1)) if rating_match else None,
             "source": source,
+            "brand": brand,
+            "category": category,
         }
+        return result
 
     return None
 
@@ -580,6 +618,20 @@ def _result_cache_key(query: str) -> str:
     return hashlib.sha256(query.encode()).hexdigest()
 
 
+async def _write_redis_cache_async(rk: str, result: dict, ttl: int):
+    """Fire-and-forget Redis cache write — never blocks pipeline return."""
+    try:
+        from app.cache.redis_cache import get_cache
+        cache_layer = await get_cache()
+        await cache_layer.set(
+            f"eva:query:{rk}",
+            {**result, "expiry": time.time() + ttl},
+            ttl=ttl,
+        )
+    except Exception as e:
+        append_log("DEBUG", f"Redis cache write skipped: {type(e).__name__}")
+
+
 def _build_llm_messages(
     system_prompt: str,
     user_query: str,
@@ -603,6 +655,18 @@ def _build_llm_messages(
     return messages
 
 
+def _has_price_data(products: list[dict]) -> bool:
+    """v11: 检查商品列表中是否有真实价格数据。
+
+    无价格=0的商品可能是web搜索的垃圾链接，不应优先于product_db的有价商品。
+    至少40%商品需要有 >0 的价格才算有效。
+    """
+    if not products:
+        return False
+    priced = sum(1 for p in products if p.get("price") and p["price"] > 0)
+    return priced >= len(products) * 0.4
+
+
 # ---------------------------------------------------------------------------
 # Main Pipeline Entry Point (v6 — 5-Layer Search Strategy)
 # ---------------------------------------------------------------------------
@@ -623,7 +687,6 @@ async def run_pipeline(
     stream_callback: Callable[[str], Awaitable[None]] | None = None,
     bypass_cache: bool = False,
     chat_history: list[dict] | None = None,  # v10: 多轮对话历史 [{role, content}...]
-    chat_context: str = "",  # DEPRECATED: 保留向后兼容，优先使用 chat_history
 ) -> dict:
     """v6 Multi-layer shopping pipeline. Returns at least 1 product whenever possible.
 
@@ -740,6 +803,7 @@ async def run_pipeline(
             gateway_prompt = get_gateway_prompt(intent_result.intent.value)
 
             # For trending/recommend that may benefit from product context
+            enriched_query = user_query
             if intent_result.intent.value in ("trend_analysis", "recommend_products", "shopping_guide"):
                 try:
                     from app.agent.product_db import get_trending_products
@@ -749,15 +813,15 @@ async def run_pipeline(
                             f"- {h['title']} ({h['brand']}, ¥{h['price_min']}-{h['price_max']})"
                             for h in hot[:5]
                         )
-                        user_query = f"{user_query}\n\n{context}"
+                        enriched_query = f"{user_query}\n\n{context}"
                 except Exception as e:
                     append_log("DEBUG", f"Trending products lookup skipped: {type(e).__name__}")
 
             # v10: LLM 使用完整 messages 数组（含多轮历史），搜索已用纯净 query
-            llm_messages = _build_llm_messages(gateway_prompt, user_query, chat_history)
+            llm_messages = _build_llm_messages(gateway_prompt, enriched_query, chat_history)
             review_text, _, llm_ms = await llm_call(
                 system_prompt=gateway_prompt,  # kept for cache key compat
-                user_message=user_query,        # kept for cache key compat
+                user_message=enriched_query,    # kept for cache key compat
                 messages=llm_messages,          # v10: full multi-turn context
                 max_tokens=route_cfg.llm_max_tokens,
                 temperature=route_cfg.llm_temperature,
@@ -789,10 +853,19 @@ async def run_pipeline(
             timer.start("parallel_layers")
 
             async def _layer0_search():
-                """Layer 0: Hot Products Database"""
+                """Layer 0: Hot Products Database — 使用原始查询+rewrite变体搜索"""
                 try:
                     from app.agent.product_db import search_products as search_hot_products
+                    # v11修复: 先用原始query，再用rewrite变体搜索
                     hot = await search_hot_products(user_query, top_k=5)
+                    if not hot and expanded_query.expanded:
+                        for variant in expanded_query.expanded[1:4]:  # 跳过原始，试前3个变体
+                            if variant == user_query:
+                                continue
+                            hot = await search_hot_products(variant, top_k=5)
+                            if hot:
+                                append_log("INFO", f"[Layer 0] 变体命中: '{variant[:30]}' -> {len(hot)}件")
+                                break
                     if hot:
                         normalized = []
                         for hp in hot:
@@ -899,25 +972,27 @@ async def run_pipeline(
             # Layer 2.5 结果 (SerpAPI — Google Shopping 数据)
             _, serpapi_products = l25_result
 
-            # 优先级合并：官方API > SerpAPI 真实数据 > 热门商品 > RAG > 缓存
-            if official_products:
+            # v11修复: 优先级重排 — 产品数据库(真实价格) > 官方API > SerpAPI > RAG > 缓存
+            # 防止SerpAPI返回的无价格web链接覆盖product_db的真实商品数据
+            if hot_products and _has_price_data(hot_products):
+                products = hot_products
+                source_type = "hot_products"
+                search_layers_used.append("hot_products")
+                review = {"verdict": f"数据来自热门商品库（{len(products)}件商品）",
+                          "pros": [], "cons": []}
+            elif official_products and _has_price_data(official_products):
                 products = official_products
                 source_type = "official_api"
                 search_layers_used.append("official_api")
                 review = {"verdict": f"数据来自电商平台官方API（{len(products)}件商品）",
                           "pros": [], "cons": []}
-            elif serpapi_products:
+            elif serpapi_products and _has_price_data(serpapi_products):
                 products = serpapi_products
                 source_type = "serpapi_shopping"
                 search_layers_used.append("serpapi_shopping")
                 real_img = sum(1 for p in products if p.get("image_url"))
                 review = {"verdict": f"数据来自Google Shopping实时搜索（{len(products)}件商品，{real_img}件含真实图片）",
                           "pros": [], "cons": []}
-            elif hot_products:
-                products = hot_products
-                source_type = "hot_products"
-                search_layers_used.append("hot_products")
-                review = {"verdict": "数据来自热门商品库（并行搜索）", "pros": [], "cons": []}
             elif rag_prods:
                 products = rag_prods
                 source_type = "rag"
@@ -928,6 +1003,17 @@ async def run_pipeline(
                 source_type = "cache"
                 search_layers_used.append("product_cache")
                 review = {"verdict": "数据来自商品缓存（并行搜索）", "pros": [], "cons": []}
+            # 回退: 无价格数据的official/serpapi结果作为最后手段
+            elif official_products:
+                products = official_products
+                source_type = "official_api"
+                search_layers_used.append("official_api")
+                review = {"verdict": "数据来自电商平台API（价格待确认）", "pros": [], "cons": []}
+            elif serpapi_products:
+                products = serpapi_products
+                source_type = "serpapi_shopping"
+                search_layers_used.append("serpapi_shopping")
+                review = {"verdict": "数据来自实时搜索（价格待确认）", "pros": [], "cons": []}
             else:
                 # 并行搜索无结果，尝试RAG变体
                 try:
@@ -1193,6 +1279,21 @@ async def run_pipeline(
                           f"(category={'on' if category_constraint.is_valid else 'off'})")
             timer.stop("layer5_platform_links")
 
+        # ── Layer 5.5: Template Match Fallback (known products with review data) ──
+        if not products:
+            from app.agent.product_templates import match_template
+            template_result = match_template(user_query)
+            if template_result:
+                t_products, t_review = template_result
+                products = [_enrich_product(p) for p in t_products]
+                for p in products:
+                    p["source"] = "template_match"
+                source_type = "template_match"
+                search_layers_used.append("template_match")
+                review = t_review
+                append_log("INFO", f"[Layer 5.5] 模板匹配命中: {len(products)}件 "
+                          f"(query='{user_query[:50]}')")
+
         # ── Layer 6: Entity-aware Search URL Generation (guaranteed fallback) ──
         if not products and entity_category_ok:
             timer.start("layer6_link_fallback")
@@ -1390,13 +1491,11 @@ async def run_pipeline(
     timer.start("llm_summarize")
     # v10: LLM 使用完整 messages 数组（含多轮历史），搜索已用纯净 query
     if source_type == "none" and intent in SHOPPING_INTENTS:
-        # No data — generate helpful not_found message
-        review_text, _, llm_ms = await rag_summarize(
-            user_query, [], intent, user_id, stream_callback, source_type="none",
-            chat_history=chat_history,
-        )
-        timer.record("llm_summarize", llm_ms)
+        # v11重构: 禁止LLM生成安慰话术 → 使用静态空结果消息
+        # 不再调用 rag_summarize(_NO_DATA_PROMPT) 生成自然语言解释
+        review_text = EMPTY_RESULT_MESSAGE
         review = {"verdict": review_text, "pros": [], "cons": []}
+        append_log("INFO", "pipeline v11 空结果 — 返回结构化empty消息，跳过LLM")
     elif products and intent in SHOPPING_INTENTS:
         # Products found — summarize them
         # Build context from products + RAG docs
@@ -1493,11 +1592,41 @@ async def run_pipeline(
         # Real-time sources
         data_freshness_warning = None  # No warning needed
 
+    # v11: 构建 Debug Trace — 每层检索的命中/失败状态
+    ALL_LAYERS = ["hot_products", "trending_normalize", "rag", "product_cache",
+                  "serpapi_shopping", "official_api", "live_search", "similar_search",
+                  "platform_search_link", "template_match", "link_fallback"]
+    trace = {
+        "kb_hit": "rag" in search_layers_used,
+        "cache_hit": any(l in search_layers_used for l in ["hot_products", "product_cache", "trending_normalize"]),
+        "api_hit": any(l in search_layers_used for l in ["serpapi_shopping", "official_api", "live_search"]),
+        "similar_hit": "similar_search" in search_layers_used,
+        "fallback_used": any(l in search_layers_used for l in ["platform_search_link", "template_match", "link_fallback"]),
+        "layers_hit": {layer: (layer in search_layers_used) for layer in ALL_LAYERS},
+        "total_layers_searched": len(search_layers_used),
+    }
+
+    # v11: 统一输出协议 — status + trace + error_code
+    if products:
+        output_status = "success"
+        error_code = None
+    else:
+        output_status = "empty"
+        error_code = "NO_PRODUCT_FOUND"
+
     result = {
+        # v11 结构化协议
+        "status": output_status,
+        "query": user_query,
+        "rewritten_query": expanded_query.expanded[1] if len(expanded_query.expanded) > 1 else user_query,
+        "error_code": error_code,
+        "trace": trace,
+        # 原有字段
         "intent": intent,
         "intent_type": intent_result.intent.value,
         "intent_confidence": intent_result.confidence,
         "search_results": products,
+        "rag_docs": rag_docs,  # v10修复: RAG文档数据传递到上层，用于验证和增强总结
         "price_analysis": price_analysis,
         "review_summary": review,
         "decision": decision,
@@ -1523,16 +1652,8 @@ async def run_pipeline(
 
     # ── Legacy cache ──
     _result_cache[rk] = (time.time() + _RESULT_CACHE_TTL, result)
-    try:
-        from app.cache.redis_cache import get_cache
-        cache_layer = await get_cache()
-        await cache_layer.set(
-            f"eva:query:{rk}",
-            {**result, "expiry": time.time() + _RESULT_CACHE_TTL},
-            ttl=_RESULT_CACHE_TTL,
-        )
-    except Exception as e:
-        append_log("DEBUG", f"Redis cache write skipped: {type(e).__name__}")
+    # Fire-and-forget Redis write (don't block pipeline return)
+    asyncio.create_task(_write_redis_cache_async(rk, result, _RESULT_CACHE_TTL))
 
     append_log(
         "SUCCESS",
